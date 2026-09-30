@@ -1,6 +1,13 @@
 """A small embeddable runtime for memory-driven character behavior."""
 
 from .actions import Action, ActionContext, ActionStatus, Continue, Complete, Fail
+from .archive import (
+    Lineage,
+    WorldArchive,
+    WorldCheckpoint,
+    decisions_since,
+    diff_decisions,
+)
 from .clock import Clock, VirtualClock
 from .events import Event, EventBus
 from .memory import Memory
@@ -27,5 +34,10 @@ __all__ = [
     "VirtualClock",
     "World",
     "ActorRuntime",
+    "Lineage",
     "RuntimeSnapshot",
+    "WorldArchive",
+    "WorldCheckpoint",
+    "decisions_since",
+    "diff_decisions",
 ]

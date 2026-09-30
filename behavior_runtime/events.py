@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable
-from heapq import heappop, heappush
+from heapq import heapify, heappop, heappush
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +75,48 @@ class EventBus:
                 handler(event)
         return dispatched
 
+    def to_data(self) -> dict[str, Any]:
+        """Capture both undelivered and dispatched-but-unconsumed events."""
+        return {
+            "sequence": self._sequence,
+            "scheduled": [
+                [time, sequence, event_to_data(event)]
+                for time, sequence, event in sorted(self._scheduled)
+            ],
+            "due": [event_to_data(event) for event in self._due],
+        }
+
+    def load_data(self, data: dict[str, Any]) -> None:
+        self._sequence = int(data["sequence"])
+        self._scheduled = [
+            (float(time), int(sequence), event_from_data(event_data))
+            for time, sequence, event_data in data.get("scheduled", ())
+        ]
+        heapify(self._scheduled)
+        self._due = [event_from_data(event_data) for event_data in data.get("due", ())]
+
     @property
     def pending_count(self) -> int:
         return len(self._scheduled) + len(self._due)
+
+
+def event_to_data(event: Event) -> dict[str, Any]:
+    return {
+        "type": event.type,
+        "payload": event.payload,
+        "time": event.time,
+        "actor_id": event.actor_id,
+        "action_run_id": event.action_run_id,
+        "sequence": event.sequence,
+    }
+
+
+def event_from_data(data: dict[str, Any]) -> Event:
+    return Event(
+        type=data["type"],
+        payload=dict(data.get("payload") or {}),
+        time=float(data["time"]),
+        actor_id=data.get("actor_id"),
+        action_run_id=data.get("action_run_id"),
+        sequence=int(data["sequence"]),
+    )

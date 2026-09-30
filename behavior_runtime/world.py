@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .clock import Clock, VirtualClock
-from .events import Event, EventBus
+from .events import Event, EventBus, event_from_data, event_to_data
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,3 +76,34 @@ class World:
                 for actor_id in self._actors:
                     self._mailboxes.setdefault(actor_id, []).append(event)
         return dispatched
+
+    def to_data(self) -> dict[str, Any]:
+        """Capture shared state, time, pending events and unread mailboxes."""
+        if not hasattr(self.clock, "to_data"):
+            raise TypeError("world clock must support to_data() to be archived")
+        return {
+            "state": deepcopy(self._state),
+            "clock": self.clock.to_data(),
+            "events": self.events.to_data(),
+            "actors": sorted(self._actors),
+            "mailboxes": {
+                actor_id: [event_to_data(event) for event in mailbox]
+                for actor_id, mailbox in self._mailboxes.items()
+            },
+        }
+
+    @classmethod
+    def from_data(cls, data: dict[str, Any]) -> "World":
+        clock = VirtualClock()
+        clock.load_data(data["clock"])
+        event_bus = EventBus()
+        event_bus.load_data(data["events"])
+        world = cls(deepcopy(data.get("state") or {}), clock=clock, event_bus=event_bus)
+        world._actors = set(data.get("actors") or ())
+        world._mailboxes = {
+            actor_id: [event_from_data(event_data) for event_data in mailbox]
+            for actor_id, mailbox in (data.get("mailboxes") or {}).items()
+        }
+        for actor_id in world._actors:
+            world._mailboxes.setdefault(actor_id, [])
+        return world

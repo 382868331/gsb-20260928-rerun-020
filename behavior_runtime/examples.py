@@ -84,13 +84,18 @@ class MoveToTarget(Action):
         return ActionStatus.CANCELLED
 
     def to_config(self) -> dict[str, Any]:
-        return {"target": self.target, "travel_time": self.travel_time}
+        return {
+            "target": self.target,
+            "travel_time": self.travel_time,
+            "interrupt_count": self.interrupt_count,
+        }
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "MoveToTarget":
         return cls(
             target=str(config["target"]),
             travel_time=float(config.get("travel_time", 2.0)),
+            interrupt_count=int(config.get("interrupt_count", 0)),
         )
 
 
