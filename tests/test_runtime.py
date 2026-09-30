@@ -143,3 +143,27 @@ def test_controlled_time_preserves_event_order():
     clock.advance(1)
     second_batch = bus.dispatch_due(clock.now())
     assert [event.type for event in second_batch] == ["later"]
+
+
+def test_same_time_events_trigger_delivery_inside_same_batch():
+    bus = EventBus()
+    delivered = []
+
+    def cascade(event):
+        delivered.append(event.type)
+        if event.type == "first":
+            bus.publish("second", time=event.time)
+            bus.publish("third", time=event.time)
+        if event.type == "second":
+            bus.publish("fourth", time=event.time)
+
+    bus.subscribe(cascade)
+    bus.publish("first", time=1.0)
+
+    assert [event.type for event in bus.dispatch_due(1.0)] == [
+        "first",
+        "second",
+        "third",
+        "fourth",
+    ]
+    assert delivered == ["first", "second", "third", "fourth"]

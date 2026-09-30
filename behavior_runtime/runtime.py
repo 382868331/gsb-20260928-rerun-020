@@ -22,6 +22,7 @@ class RuntimeSnapshot:
     stale_results_ignored: int
     interrupted_runs: tuple[int, ...]
     history: tuple[dict[str, Any], ...]
+    tick_records: tuple[dict[str, Any], ...]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -34,6 +35,7 @@ class RuntimeSnapshot:
             "stale_results_ignored": self.stale_results_ignored,
             "interrupted_runs": list(self.interrupted_runs),
             "history": list(self.history),
+            "tick_records": list(self.tick_records),
         }
 
     @classmethod
@@ -48,6 +50,7 @@ class RuntimeSnapshot:
             stale_results_ignored=values["stale_results_ignored"],
             interrupted_runs=tuple(values["interrupted_runs"]),
             history=tuple(values["history"]),
+            tick_records=tuple(values.get("tick_records", ())),
         )
 
 
@@ -79,6 +82,7 @@ class ActorRuntime:
         self.stale_results_ignored = 0
         self.interrupted_runs: list[int] = []
         self.history: list[dict[str, Any]] = []
+        self.tick_records: list[dict[str, Any]] = []
 
     def register_action_type(self, action_type: type[Action]) -> None:
         self._action_types[action_type.action_name] = action_type
@@ -101,6 +105,7 @@ class ActorRuntime:
 
         decision = self.policy.decide(observation, self.memory, self.current_action)
         self._apply_decision(decision, observation, current_events)
+        self._record_tick(observation)
 
         if self.current_action is None:
             return self.status
@@ -145,6 +150,7 @@ class ActorRuntime:
             stale_results_ignored=self.stale_results_ignored,
             interrupted_runs=tuple(self.interrupted_runs),
             history=tuple(self.history),
+            tick_records=tuple(self.tick_records),
         )
 
     def restore(self, snapshot: RuntimeSnapshot | dict[str, Any]) -> None:
@@ -157,6 +163,7 @@ class ActorRuntime:
         self.stale_results_ignored = snapshot.stale_results_ignored
         self.interrupted_runs = list(snapshot.interrupted_runs)
         self.history = list(snapshot.history)
+        self.tick_records = list(snapshot.tick_records)
         if snapshot.action_name is None:
             self.current_action = None
             self.status = None
@@ -199,7 +206,12 @@ class ActorRuntime:
         self.status = ActionStatus.RUNNING
         start_context = self._context(observation, current_events)
         self.current_action.on_start(start_context)
-        self._record("started", self.current_action, start_context.run_id)
+        self._record(
+            "started",
+            self.current_action,
+            start_context.run_id,
+            observation=observation,
+        )
 
     def _interrupt_current(self, context: ActionContext) -> ActionStatus:
         if self.current_action is None:
@@ -274,14 +286,34 @@ class ActorRuntime:
         action: Action,
         run_id: int,
         status: ActionStatus | None = None,
+        *,
+        observation: Observation | None = None,
     ) -> None:
+        observed_event_sequences = []
+        if observation is not None:
+            observed_event_sequences = [
+                event.sequence for event in observation.events
+            ]
         self.history.append(
             {
                 "time": self.world.clock.now(),
+                "actor_order": self.world.actor_order(self.actor_id),
                 "phase": phase,
                 "run_id": run_id,
                 "action": action.action_name,
                 "action_config": deepcopy(action.to_config()),
                 "status": status.value if status else None,
+                "observed_event_sequences": observed_event_sequences,
+            }
+        )
+
+    def _record_tick(self, observation: Observation) -> None:
+        self.tick_records.append(
+            {
+                "time": observation.time,
+                "actor_order": self.world.actor_order(self.actor_id),
+                "observed_event_sequences": [
+                    event.sequence for event in observation.events
+                ],
             }
         )

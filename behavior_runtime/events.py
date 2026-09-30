@@ -85,16 +85,28 @@ class EventBus:
 
     def dispatch_due(self, now: float) -> list[Event]:
         dispatched: list[Event] = []
-        while self._scheduled and self._scheduled[0][0] <= now:
-            _, _, event = heappop(self._scheduled)
-            self._due.append(event)
-
-        while self._due:
-            event = self._due.pop(0)
+        while self._due or (
+            self._scheduled and self._scheduled[0][0] <= now
+        ):
+            if self._due:
+                event = self._due.pop(0)
+            else:
+                _, _, event = heappop(self._scheduled)
             dispatched.append(event)
             for handler in tuple(self._handlers):
                 handler(event)
         return dispatched
+
+    def discard_actor_events(self, actor_id: str) -> None:
+        self._scheduled = [
+            entry
+            for entry in self._scheduled
+            if entry[2].actor_id != actor_id
+        ]
+        heapify(self._scheduled)
+        self._due = [
+            event for event in self._due if event.actor_id != actor_id
+        ]
 
     @property
     def pending_count(self) -> int:

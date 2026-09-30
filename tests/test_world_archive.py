@@ -22,6 +22,18 @@ def make_world():
     return world, runtimes
 
 
+class OrderPolicy:
+    def __init__(self, actor_id):
+        self.actor_id = actor_id
+
+    def decide(self, observation, memory, current_action):
+        from behavior_runtime.policy import KeepCurrent
+
+        if current_action is None:
+            memory.set("observed_events", [event.sequence for event in observation.events])
+        return KeepCurrent()
+
+
 def test_world_archive_replays_uninterrupted_world():
     world, runtimes = make_world()
     run_turn(world, runtimes)
@@ -136,3 +148,117 @@ def test_branches_isolate_messages_memory_and_decisions():
     assert south_archive.branch.branch_id == "south-goal"
     assert south_archive.branch.parent_checkpoint_id == "waiting"
     assert north_archive.data != south_archive.data
+
+
+def test_archive_preserves_actor_iteration_and_decision_evidence():
+    world = World(clock=VirtualClock())
+    runtimes = {
+        actor_id: ActorRuntime(actor_id, OrderPolicy(actor_id), world)
+        for actor_id in ("zoe", "alice", "mike")
+    }
+
+    world.publish("shared", {"n": 1})
+    world.dispatch_due()
+    for runtime in runtimes.values():
+        runtime.tick()
+    archive = WorldArchive.capture(world, runtimes, checkpoint_id="ordered")
+
+    assert archive.actor_ids == ("zoe", "alice", "mike")
+    restored_world, restored = archive.restore(
+        {actor_id: OrderPolicy(actor_id) for actor_id in runtimes}
+    )
+    assert restored_world.actor_ids == ("zoe", "alice", "mike")
+    assert [
+        runtime.tick_records[-1]["actor_order"] for runtime in restored.values()
+    ] == [0, 1, 2]
+    assert all(
+        runtime.tick_records[-1]["observed_event_sequences"] == [1]
+        for runtime in restored.values()
+    )
+
+
+def test_actor_membership_changes_apply_after_same_time_dispatch():
+    world = World(clock=VirtualClock())
+    alice = ActorRuntime("alice", TargetPolicy(), world, action_types=[MoveToTarget])
+    bob = ActorRuntime("bob", TargetPolicy(), world, action_types=[MoveToTarget])
+
+    def membership_change(event):
+        if event.type == "remove_bob":
+            world.remove_actor("bob")
+            world.register_actor("carol")
+
+    world.events.subscribe(membership_change)
+    world.publish("remove_bob")
+    world.publish("bob_only", actor_id="bob")
+    world.publish("carol_only", actor_id="carol")
+    dispatched = world.dispatch_due()
+
+    assert [event.type for event in dispatched] == [
+        "remove_bob",
+        "bob_only",
+        "carol_only",
+    ]
+    assert world.actor_ids == ("alice", "carol")
+    mailboxes = world.snapshot()["mailboxes"]
+    assert [event["type"] for event in mailboxes["alice"]] == ["remove_bob"]
+    assert [event["type"] for event in mailboxes["carol"]] == ["carol_only"]
+    assert "bob" not in mailboxes
+    assert world.events.pending_count == 0
+
+
+def test_actor_that_leaves_and_rejoins_does_not_replay_batch_broadcast():
+    world = World(clock=VirtualClock())
+    ActorRuntime("alice", TargetPolicy(), world, action_types=[MoveToTarget])
+    ActorRuntime("bob", TargetPolicy(), world, action_types=[MoveToTarget])
+
+    def membership_change(event):
+        if event.type == "leave":
+            world.remove_actor("bob")
+            world.register_actor("bob")
+
+    world.events.subscribe(membership_change)
+    world.publish("leave")
+    world.publish("bob_only", actor_id="bob")
+    world.dispatch_due()
+
+    mailboxes = world.snapshot()["mailboxes"]
+    assert [event["type"] for event in mailboxes["alice"]] == ["leave"]
+    assert [event["type"] for event in mailboxes["bob"]] == ["bob_only"]
+
+
+def test_deleted_waiting_events_and_memory_are_not_shared_across_restores():
+    world, runtimes = make_world()
+    run_turn(world, runtimes)
+    base = WorldArchive.capture(world, runtimes, checkpoint_id="base")
+
+    left_world, left = base.restore(
+        {"alice": TargetPolicy(), "bob": TargetPolicy()},
+        action_types={"alice": [MoveToTarget], "bob": [MoveToTarget]},
+    )
+    other_world, other = base.restore(
+        {"alice": TargetPolicy(), "bob": TargetPolicy()},
+        action_types={"alice": [MoveToTarget], "bob": [MoveToTarget]},
+    )
+
+    left_world.remove_actor("bob")
+    left["alice"].memory.set("private", "left")
+    other["bob"].memory.set("private", "other")
+    deleted_archive = WorldArchive.capture(left_world, left, checkpoint_id="bob-left")
+
+    assert deleted_archive.actor_ids == ("alice",)
+    assert deleted_archive.data["world"]["actor_order"] == ["alice"]
+    restored_deleted_world, restored_deleted = deleted_archive.restore(
+        {"alice": TargetPolicy()},
+        action_types={"alice": [MoveToTarget]},
+    )
+    assert restored_deleted_world.actor_ids == ("alice",)
+    assert restored_deleted_world.events.pending_count == (
+        left_world.events.pending_count
+    )
+    serialized_events = restored_deleted_world.events.snapshot()
+    assert all(
+        event["actor_id"] != "bob"
+        for event in [*serialized_events["scheduled"], *serialized_events["due"]]
+    )
+    assert other["alice"].memory.get("private") is None
+    assert other["bob"].memory.get("private") == "other"
