@@ -143,3 +143,105 @@ def test_controlled_time_preserves_event_order():
     clock.advance(1)
     second_batch = bus.dispatch_due(clock.now())
     assert [event.type for event in second_batch] == ["later"]
+
+
+def test_same_time_events_keep_publication_and_causal_order_after_restore():
+    clock = VirtualClock()
+    bus = EventBus()
+
+    def publish_follow_up(event):
+        if event.type == "cause":
+            bus.publish(
+                "effect",
+                {"by": event.sequence},
+                time=clock.now(),
+                caused_by=event.sequence,
+            )
+
+    unsubscribe = bus.subscribe(publish_follow_up)
+    bus.publish("second", time=clock.now())
+    bus.publish("cause", time=clock.now())
+    bus.publish("first", time=clock.now())
+
+    dispatched = bus.dispatch_due(clock.now())
+    assert [event.type for event in dispatched] == [
+        "second",
+        "cause",
+        "effect",
+        "first",
+    ]
+    assert dispatched[2].caused_by == dispatched[1].sequence
+    unsubscribe()
+
+    restored_bus = EventBus()
+    restored_bus.restore(bus.snapshot())
+    clock.advance(1)
+    restored_bus.publish("later", time=clock.now())
+    assert [event.type for event in restored_bus.dispatch_due(clock.now())] == [
+        "later"
+    ]
+
+
+def test_actor_registration_order_is_stable_and_survives_restore():
+    clock = VirtualClock()
+    world = World(clock=clock)
+    world.register_actor("zoe")
+    world.register_actor("alice")
+    world.register_actor("mike")
+
+    assert world.actor_ids == ("zoe", "alice", "mike")
+
+    restored = World(clock=VirtualClock())
+    restored.restore(world.snapshot())
+    assert restored.actor_ids == ("zoe", "alice", "mike")
+
+    world.remove_actor("alice")
+    world.register_actor("alice")
+    assert world.actor_ids == ("zoe", "mike", "alice")
+
+
+def test_deleted_actor_does_not_receive_old_or_restored_private_events():
+    clock = VirtualClock()
+    world = World(clock=clock)
+    world.register_actor("actor")
+    world.publish("private", {"generation": 1}, actor_id="actor", delay=1)
+    data = world.snapshot()
+
+    world.remove_actor("actor")
+    clock.advance(1)
+    assert world.dispatch_due() == []
+
+    world.register_actor("actor")
+    assert world.dispatch_due() == []
+    assert world.observe("actor").events == ()
+
+    restored = World(clock=VirtualClock())
+    restored.restore(data)
+    restored.remove_actor("actor")
+    restored.register_actor("actor")
+    restored.clock.advance(1)
+    restored.dispatch_due()
+    assert restored.observe("actor").events == ()
+
+
+def test_actor_join_during_dispatch_starts_on_next_dispatch():
+    clock = VirtualClock()
+    world = World(clock=clock)
+    world.register_actor("present")
+    world.publish("announcement")
+
+    def join_late(event):
+        if event.type == "announcement":
+            world.register_actor("late")
+
+    unsubscribe = world.events.subscribe(join_late)
+    dispatched = world.dispatch_due()
+    unsubscribe()
+
+    assert [event.actor_id for event in dispatched] == [None]
+    assert world.observe("present").events[0].type == "announcement"
+    assert world.observe("late").events == ()
+
+    world.publish("next_announcement")
+    world.dispatch_due()
+    assert world.observe("late").events[0].type == "next_announcement"

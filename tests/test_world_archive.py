@@ -22,6 +22,14 @@ def make_world():
     return world, runtimes
 
 
+def wait_for_arrivals(world, runtimes):
+    world.clock.advance(1)
+    delivered = world.dispatch_due()
+    for runtime in runtimes.values():
+        runtime.tick()
+    return delivered
+
+
 def test_world_archive_replays_uninterrupted_world():
     world, runtimes = make_world()
     run_turn(world, runtimes)
@@ -136,3 +144,51 @@ def test_branches_isolate_messages_memory_and_decisions():
     assert south_archive.branch.branch_id == "south-goal"
     assert south_archive.branch.parent_checkpoint_id == "waiting"
     assert north_archive.data != south_archive.data
+
+
+def test_restored_waiting_actions_replay_same_event_sequence():
+    world, runtimes = make_world()
+    run_turn(world, runtimes)
+    checkpoint = WorldArchive.capture(
+        world, runtimes, checkpoint_id="waiting", branch_id="main"
+    )
+
+    expected = wait_for_arrivals(world, runtimes)
+    restored_world, restored = checkpoint.restore(
+        {"alice": TargetPolicy(), "bob": TargetPolicy()},
+        action_types={"alice": [MoveToTarget], "bob": [MoveToTarget]},
+    )
+    actual = wait_for_arrivals(restored_world, restored)
+
+    assert [event.to_dict() for event in actual] == [
+        event.to_dict() for event in expected
+    ]
+    assert [event.sequence for event in actual] == [1, 3, 2, 4]
+    assert restored_world.snapshot() == world.snapshot()
+
+
+def test_action_history_records_total_order_and_triggering_events():
+    world, runtimes = make_world()
+    run_turn(world, runtimes)
+    world.clock.advance(2)
+    world.dispatch_due()
+    for runtime in runtimes.values():
+        runtime.tick()
+
+    started = [
+        event
+        for runtime in runtimes.values()
+        for event in runtime.history
+        if event["phase"] == "started"
+    ]
+    assert [event["actor_id"] for event in started] == ["alice", "bob"]
+    assert [event["order"] for event in started] == [1, 2]
+    assert [event["actor_index"] for event in started] == [0, 1]
+
+    finished = [
+        event
+        for runtime in runtimes.values()
+        for event in runtime.history
+        if event["phase"] == "finished"
+    ]
+    assert [event["order"] for event in finished] == [3, 4]

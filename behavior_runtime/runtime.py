@@ -199,7 +199,14 @@ class ActorRuntime:
         self.status = ActionStatus.RUNNING
         start_context = self._context(observation, current_events)
         self.current_action.on_start(start_context)
-        self._record("started", self.current_action, start_context.run_id)
+        self._record(
+            "started",
+            self.current_action,
+            start_context.run_id,
+            trigger_event_sequences=tuple(
+                event.sequence for event in observation.events
+            ),
+        )
 
     def _interrupt_current(self, context: ActionContext) -> ActionStatus:
         if self.current_action is None:
@@ -274,14 +281,20 @@ class ActorRuntime:
         action: Action,
         run_id: int,
         status: ActionStatus | None = None,
+        trigger_event_sequences: tuple[int, ...] = (),
     ) -> None:
+        order, actor_index = self.world.action_order(self.actor_id)
         self.history.append(
             {
+                "actor_id": self.actor_id,
+                "order": order,
+                "actor_index": actor_index,
                 "time": self.world.clock.now(),
                 "phase": phase,
                 "run_id": run_id,
                 "action": action.action_name,
                 "action_config": deepcopy(action.to_config()),
                 "status": status.value if status else None,
+                "trigger_event_sequences": list(trigger_event_sequences),
             }
         )
