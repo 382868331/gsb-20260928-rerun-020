@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from typing import Protocol
 
 
@@ -23,3 +25,9 @@ class VirtualClock:
             raise ValueError("delta_seconds must be non-negative")
         self._time += float(delta_seconds)
         return self._time
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"time": self._time}
+
+    def restore(self, data: dict[str, Any]) -> None:
+        self._time = float(data["time"])

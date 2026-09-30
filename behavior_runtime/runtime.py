@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -280,6 +281,7 @@ class ActorRuntime:
                 "phase": phase,
                 "run_id": run_id,
                 "action": action.action_name,
+                "action_config": deepcopy(action.to_config()),
                 "status": status.value if status else None,
             }
         )

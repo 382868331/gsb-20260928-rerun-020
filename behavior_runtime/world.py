@@ -40,6 +40,41 @@ class World:
     def state(self) -> dict[str, Any]:
         return self._state
 
+    @property
+    def actor_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._actors))
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "state": deepcopy(self._state),
+            "time": self.clock.now(),
+            "clock": deepcopy(self.clock.snapshot()),
+            "events": deepcopy(self.events.snapshot()),
+            "actors": list(self._actors),
+            "mailboxes": {
+                actor_id: [
+                    event.to_dict()
+                    for event in self._mailboxes.get(actor_id, ())
+                ]
+                for actor_id in self._actors
+            },
+        }
+
+    def restore(self, data: dict[str, Any]) -> None:
+        self._state = deepcopy(data["state"])
+        clock_data = data.get("clock") or {"time": data.get("time", 0.0)}
+        if not hasattr(self.clock, "restore"):
+            raise TypeError("world clock does not support restoration")
+        self.clock.restore(clock_data)
+        self.events.restore(deepcopy(data["events"]))
+        self._actors = set(data.get("actors", ()))
+        self._mailboxes = {
+            actor_id: [Event.from_dict(event_data) for event_data in events]
+            for actor_id, events in data.get("mailboxes", {}).items()
+        }
+        for actor_id in self._actors:
+            self._mailboxes.setdefault(actor_id, [])
+
     def observe(self, actor_id: str) -> Observation:
         events = tuple(self._mailboxes.pop(actor_id, []))
         return Observation(

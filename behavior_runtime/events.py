@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable
-from heapq import heappop, heappush
+from heapq import heapify, heappop, heappush
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +13,27 @@ class Event:
     actor_id: str | None = None
     action_run_id: int | None = None
     sequence: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "payload": dict(self.payload),
+            "time": self.time,
+            "actor_id": self.actor_id,
+            "action_run_id": self.action_run_id,
+            "sequence": self.sequence,
+        }
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> "Event":
+        return cls(
+            type=values["type"],
+            payload=dict(values.get("payload") or {}),
+            time=float(values["time"]),
+            actor_id=values.get("actor_id"),
+            action_run_id=values.get("action_run_id"),
+            sequence=int(values.get("sequence", 0)),
+        )
 
 
 EventHandler = Callable[[Event], None]
@@ -78,3 +99,21 @@ class EventBus:
     @property
     def pending_count(self) -> int:
         return len(self._scheduled) + len(self._due)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "sequence": self._sequence,
+            "scheduled": [event.to_dict() for _, _, event in self._scheduled],
+            "due": [event.to_dict() for event in self._due],
+        }
+
+    def restore(self, data: dict[str, Any]) -> None:
+        self._sequence = int(data.get("sequence", 0))
+        scheduled = []
+        for event_data in data.get("scheduled", ()):
+            event = Event.from_dict(event_data)
+            scheduled.append((event.time, event.sequence, event))
+        heapify(scheduled)
+        self._scheduled = scheduled
+        self._due = [Event.from_dict(event_data) for event_data in data.get("due", ())]
+        self._handlers = []
