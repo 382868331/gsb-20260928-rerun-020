@@ -6,6 +6,7 @@ from typing import Any
 
 from .clock import Clock, VirtualClock
 from .events import Event, EventBus
+from .promises import PromiseBook
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,7 @@ class World:
         self._batch_new_members: set[str] = set()
         self._pending_actor_changes: dict[str, bool] = {}
         self._dispatching = False
+        self.promises = PromiseBook(self)
 
     def register_actor(self, actor_id: str) -> None:
         if self._dispatching:
@@ -50,6 +52,7 @@ class World:
         self._actors.pop(actor_id, None)
         self._mailboxes.pop(actor_id, None)
         self.events.discard_actor_events(actor_id)
+        self.promises.settle_participant_left(actor_id)
 
     def unregister_actor(self, actor_id: str) -> None:
         self.remove_actor(actor_id)
@@ -76,6 +79,7 @@ class World:
             "events": deepcopy(self.events.snapshot()),
             "actors": list(self._actors),
             "actor_order": list(self._actors),
+            "promises": deepcopy(self.promises.snapshot()),
             "mailboxes": {
                 actor_id: [
                     event.to_dict()
@@ -96,6 +100,10 @@ class World:
             raise TypeError("world clock does not support restoration")
         self.clock.restore(clock_data)
         self.events.restore(deepcopy(data["events"]))
+        # EventBus.restore drops handlers (they may capture stale branches);
+        # re-subscribe this world's promise ledger to the fresh bus.
+        self.promises = PromiseBook(self)
+        self.promises.restore(deepcopy(data.get("promises")))
         actor_ids = data.get("actor_order", data.get("actors", ()))
         self._actors = dict.fromkeys(actor_ids)
         self._mailboxes = {

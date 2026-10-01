@@ -36,6 +36,8 @@ class ActionContext:
     observation: "Observation"
     memory: "Memory"
     result_events: tuple[Event, ...]
+    promise_id: str | None = None
+    requester_id: str | None = None
 
     def emit(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
         self.world.publish(event_type, payload, actor_id=self.actor_id)
@@ -53,6 +55,35 @@ class ActionContext:
             actor_id=self.actor_id,
             action_run_id=self.run_id,
             delay=delay,
+        )
+
+    def request_promise(
+        self,
+        action_name: str,
+        action_config: dict[str, Any] | None = None,
+        *,
+        deadline: float,
+        promiser: str | None = None,
+        requester: str | None = None,
+        reason: str | None = None,
+    ) -> str:
+        """Schedule a follow-up promise, keeping the provenance chain."""
+
+        return self.world.promises.request(
+            promiser or self.actor_id,
+            action_name,
+            action_config,
+            deadline=deadline,
+            requester=(
+                requester
+                if requester is not None
+                else (self.requester_id or self.actor_id)
+            ),
+            reason=reason,
+            source_promise_id=self.promise_id,
+            origin_event_sequence=(
+                self.result_events[0].sequence if self.result_events else None
+            ),
         )
 
 

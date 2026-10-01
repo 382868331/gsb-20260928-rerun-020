@@ -108,6 +108,22 @@ class EventBus:
             event for event in self._due if event.actor_id != actor_id
         ]
 
+    def discard_promise_events(self, promise_id: str) -> None:
+        """Drop every still-queued event that belongs to one promise."""
+
+        def belongs(entry_event: Event) -> bool:
+            return entry_event.payload.get("promise_id") == promise_id
+
+        self._scheduled = [
+            entry
+            for entry in self._scheduled
+            if not belongs(entry[2])
+        ]
+        heapify(self._scheduled)
+        self._due = [
+            event for event in self._due if not belongs(event)
+        ]
+
     @property
     def pending_count(self) -> int:
         return len(self._scheduled) + len(self._due)

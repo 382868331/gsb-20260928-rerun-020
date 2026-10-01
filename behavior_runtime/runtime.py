@@ -7,6 +7,7 @@ from typing import Any, Iterable
 from .actions import Action, ActionContext, ActionStatus
 from .events import Event
 from .memory import Memory
+from .promises import WAITING
 from .policy import Decision, KeepCurrent, StartAction, StopCurrent
 from .world import Observation, World
 
@@ -23,6 +24,8 @@ class RuntimeSnapshot:
     interrupted_runs: tuple[int, ...]
     history: tuple[dict[str, Any], ...]
     tick_records: tuple[dict[str, Any], ...]
+    promise_runs: tuple[dict[str, Any], ...]
+    current_promise_id: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -36,6 +39,8 @@ class RuntimeSnapshot:
             "interrupted_runs": list(self.interrupted_runs),
             "history": list(self.history),
             "tick_records": list(self.tick_records),
+            "promise_runs": list(self.promise_runs),
+            "current_promise_id": self.current_promise_id,
         }
 
     @classmethod
@@ -51,6 +56,8 @@ class RuntimeSnapshot:
             interrupted_runs=tuple(values["interrupted_runs"]),
             history=tuple(values["history"]),
             tick_records=tuple(values.get("tick_records", ())),
+            promise_runs=tuple(values.get("promise_runs", ())),
+            current_promise_id=values.get("current_promise_id"),
         )
 
 
@@ -83,12 +90,17 @@ class ActorRuntime:
         self.interrupted_runs: list[int] = []
         self.history: list[dict[str, Any]] = []
         self.tick_records: list[dict[str, Any]] = []
+        self.promise_runs: list[dict[str, Any]] = []
+        self.current_promise_id: str | None = None
 
     def register_action_type(self, action_type: type[Action]) -> None:
         self._action_types[action_type.action_name] = action_type
 
     def tick(self) -> ActionStatus | None:
         observation = self.world.observe(self.actor_id)
+        promise_event = self._consume_due_promise(observation)
+        if promise_event is not None:
+            observation = self.world.observe(self.actor_id)
         current_events, stale_events = self._partition_events(observation)
         for event in stale_events:
             self.stale_results_ignored += 1
@@ -103,14 +115,46 @@ class ActorRuntime:
                 action_run_id=self.run_id,
             )
 
-        decision = self.policy.decide(observation, self.memory, self.current_action)
-        self._apply_decision(decision, observation, current_events)
+        promised_action: Action | None = None
+        if promise_event is not None:
+            promised_action = self._build_promised_action(promise_event)
+            if promised_action is None:
+                self.world.promises.abort_unknown_action(
+                    promise_event.payload["promise_id"]
+                )
+                promise_event = None
+            elif self.current_action is not None:
+                # The promiser is busy: the promise keeps waiting until a later
+                # tick instead of interrupting unrelated work.
+                mailbox = self.world._mailboxes.setdefault(self.actor_id, [])
+                mailbox.insert(0, promise_event)
+                promise_event = None
+                promised_action = None
+
+        if promised_action is not None:
+            self._start_promised_action(
+                promised_action, promise_event, observation, current_events
+            )
+            current_events = (promise_event, *current_events)
+        else:
+            decision = self.policy.decide(
+                observation, self.memory, self.current_action
+            )
+            self._apply_decision(decision, observation, current_events)
         self._record_tick(observation)
 
         if self.current_action is None:
             return self.status
 
-        context = self._context(observation, current_events)
+        context = self._context(
+            observation,
+            current_events,
+            promise_id=(
+                promise_event.payload["promise_id"]
+                if promised_action is not None
+                else self.current_promise_id
+            ),
+        )
         status = self.current_action.tick(context)
         if status is ActionStatus.RUNNING:
             self.status = status
@@ -124,6 +168,11 @@ class ActorRuntime:
         if self.current_action is None:
             return self.status
         observation = self.world.observe(self.actor_id)
+        due_promise = self._consume_due_promise(observation)
+        if due_promise is not None:
+            mailbox = self.world._mailboxes.setdefault(self.actor_id, [])
+            mailbox.insert(0, due_promise)
+            observation = self.world.observe(self.actor_id)
         current_events, stale_events = self._partition_events(observation)
         self.stale_results_ignored += len(stale_events)
         context = self._context(observation, ())
@@ -151,6 +200,8 @@ class ActorRuntime:
             interrupted_runs=tuple(self.interrupted_runs),
             history=tuple(self.history),
             tick_records=tuple(self.tick_records),
+            promise_runs=tuple(self.promise_runs),
+            current_promise_id=self.current_promise_id,
         )
 
     def restore(self, snapshot: RuntimeSnapshot | dict[str, Any]) -> None:
@@ -164,6 +215,8 @@ class ActorRuntime:
         self.interrupted_runs = list(snapshot.interrupted_runs)
         self.history = list(snapshot.history)
         self.tick_records = list(snapshot.tick_records)
+        self.promise_runs = list(snapshot.promise_runs)
+        self.current_promise_id = snapshot.current_promise_id
         if snapshot.action_name is None:
             self.current_action = None
             self.status = None
@@ -188,6 +241,7 @@ class ActorRuntime:
                 status = self._interrupt_current(context)
                 self.current_action = None
                 self.status = status
+                self.current_promise_id = None
             return
         if not isinstance(decision, StartAction):
             raise TypeError(f"unsupported decision: {decision!r}")
@@ -197,6 +251,7 @@ class ActorRuntime:
             status = self._interrupt_current(context)
             self.current_action = None
             self.status = status
+            self.current_promise_id = None
 
         self.run_id += 1
         self.current_action = decision.action
@@ -221,14 +276,28 @@ class ActorRuntime:
         if not status.terminal:
             status = ActionStatus.CANCELLED
         self.interrupted_runs.append(context.run_id)
-        self._record("interrupted", action, context.run_id, status)
+        promise_id = context.promise_id
+        if promise_id is None:
+            promise_id = self.current_promise_id
+        self._record(
+            "interrupted",
+            action,
+            context.run_id,
+            status,
+            promise_id=promise_id,
+        )
         self.world.publish(
             "action_interrupted",
             {"action": action.action_name, "status": status.value},
             actor_id=self.actor_id,
             action_run_id=context.run_id,
         )
-        self._finish_run(status, context, publish_finished=False)
+        self._finish_run(
+            status,
+            context,
+            publish_finished=False,
+            promise_id=promise_id,
+        )
         return status
 
     def _finish_run(
@@ -237,19 +306,39 @@ class ActorRuntime:
         context: ActionContext,
         *,
         publish_finished: bool = True,
+        promise_id: str | None = None,
     ) -> None:
         action = self.current_action
         if action is None:
             return
         self.status = status
-        self._record("finished", action, context.run_id, status)
+        record_promise_id = promise_id
+        if record_promise_id is None:
+            record_promise_id = self._promise_id_for_run(context.run_id)
+        self._record(
+            "finished",
+            action,
+            context.run_id,
+            status,
+            promise_id=record_promise_id,
+        )
         if publish_finished:
             self.world.publish(
                 "action_finished",
-                {"action": action.action_name, "status": status.value},
+                {
+                    "action": action.action_name,
+                    "status": status.value,
+                    "promise_id": record_promise_id,
+                },
                 actor_id=self.actor_id,
                 action_run_id=context.run_id,
             )
+        if record_promise_id is not None:
+            self.world.promises.finish_run(
+                record_promise_id, context.run_id, status.value
+            )
+        if self.current_promise_id == record_promise_id:
+            self.current_promise_id = None
         self.current_action = None
 
     def _partition_events(
@@ -270,7 +359,20 @@ class ActorRuntime:
 
     def _context(
         self, observation: Observation, result_events: tuple[Event, ...]
+        ,
+        *,
+        promise_id: str | None = None,
     ) -> ActionContext:
+        effective_promise_id = (
+            promise_id
+            if promise_id is not None
+            else self.current_promise_id
+        )
+        requester_id = None
+        if effective_promise_id is not None:
+            promised = self.world.promises.find(effective_promise_id)
+            if promised is not None:
+                requester_id = promised["requester"]
         return ActionContext(
             actor_id=self.actor_id,
             run_id=self.run_id,
@@ -278,7 +380,91 @@ class ActorRuntime:
             observation=observation,
             memory=self.memory,
             result_events=result_events,
+            promise_id=effective_promise_id,
+            requester_id=requester_id,
         )
+
+    def _consume_due_promise(
+        self, observation: Observation
+    ) -> Event | None:
+        """Take the oldest still-valid promise_due for this actor.
+
+        A due event whose promise is no longer waiting was already arbitrated
+        (withdrawal or participant removal); it is discarded silently.
+        """
+        kept: list[Event] = []
+        chosen: Event | None = None
+        for event in observation.events:
+            if chosen is None and event.type == "promise_due":
+                promise_id = event.payload.get("promise_id")
+                record = self.world.promises.find(promise_id)
+                if record is not None and record["status"] == WAITING:
+                    chosen = event
+                    continue
+            kept.append(event)
+        if chosen is None:
+            return None
+        self._requeue_events_front(kept)
+        return chosen
+
+    def _requeue_events_front(self, events: list[Event]) -> None:
+        mailbox = self.world._mailboxes.setdefault(self.actor_id, [])
+        mailbox[0:0] = list(events)
+
+    def _build_promised_action(self, event: Event) -> Action | None:
+        promise_id = event.payload["promise_id"]
+        record = self.world.promises.find(promise_id)
+        if record is None:
+            return None
+        action_type = self._action_types.get(record["action_name"])
+        if action_type is None:
+            return None
+        return action_type.from_config(record["action_config"])
+
+    def _start_promised_action(
+        self,
+        action: Action,
+        promise_event: Event,
+        observation: Observation,
+        current_events: tuple[Event, ...],
+    ) -> None:
+        if self.current_action is not None:
+            raise RuntimeError("promised action cannot replace running action")
+        promise_id = promise_event.payload["promise_id"]
+        record = self.world.promises.get(promise_id)
+        self.run_id += 1
+        self.current_action = action
+        self.current_promise_id = promise_id
+        self._action_types.setdefault(action.action_name, type(action))
+        self.status = ActionStatus.RUNNING
+        self.promise_runs.append(
+            {
+                "promise_id": promise_id,
+                "run_id": self.run_id,
+                "request_event_sequence": record["request_event_sequence"],
+                "due_event_sequence": promise_event.sequence,
+            }
+        )
+        start_context = self._context(
+            observation, current_events, promise_id=promise_id
+        )
+        self.world.promises.start(
+            promise_id, self.run_id, promise_event.sequence
+        )
+        action.on_start(start_context)
+        self._record(
+            "started",
+            action,
+            start_context.run_id,
+            observation=observation,
+            promise_id=promise_id,
+        )
+
+    def _promise_id_for_run(self, run_id: int) -> str | None:
+        for entry in reversed(self.promise_runs):
+            if entry["run_id"] == run_id:
+                return entry["promise_id"]
+        return None
 
     def _record(
         self,
@@ -288,6 +474,7 @@ class ActorRuntime:
         status: ActionStatus | None = None,
         *,
         observation: Observation | None = None,
+        promise_id: str | None = None,
     ) -> None:
         observed_event_sequences = []
         if observation is not None:
@@ -303,6 +490,7 @@ class ActorRuntime:
                 "action": action.action_name,
                 "action_config": deepcopy(action.to_config()),
                 "status": status.value if status else None,
+                "promise_id": promise_id,
                 "observed_event_sequences": observed_event_sequences,
             }
         )
