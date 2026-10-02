@@ -22,6 +22,13 @@
 - 承诺可携带 `cause`（来源事件序号、父承诺 id、原因）与 `wait_reason`；生效、撤回、到期等事件序号都写入 `history`，可沿记录从动作追溯到原请求。
 - 角色离开世界时，其参与的等待中或已开始的承诺以 `participant_lost:<actor_id>` 结束原因关闭，历史保留。
 - 承诺随 `World.snapshot()` 一起存入存档；从同一存档派生的分支承诺与私有记忆互不影响，恰在到期或移除前保存后继续运行与连续运行逐条一致。
+- `World.request_joint_group(...)` 登记由多个参与者承诺组成的共同决定：所有成员 `mark_joint_member_ready` 后，下一次 `dispatch_due()` 才共同生效；单个成员就绪或单个承诺到期都不会提前执行组合动作。
+- 组状态视图 `joint_group_status()` 给出仍在等待谁（`waiting_on`）、已满足的约束（`satisfied`）以及准备占用的共享资源（`prepared_resources`）；资源在等待期是 `provisional` 预约，生效后才变为 `held`。
+- 开始前任一参与者撤回可用 `withdraw_joint_group` 放弃整组（保留撤回原因），或用 `propose_joint_replacement` 提出替代参与者的新方案；原承诺、撤回原因与历史完整保留，等待中被替代的旧组标记为 `superseded`，已开始的组不能替代也不能回到等待。
+- 两个组争用同一资源时按“最早请求优先”（创建时间、组 id 次序）结算并记录 `resource-contention-earliest-request-wins`；失败组立即释放预约（`resource-contention-loser-releases-reservation`），保持等待、不留下任何占用，待胜出者完成释放后可在下一次结算生效。
+- 同一时刻核对顺序固定：显式撤回、参与者离开先于结算；结算时整组/成员有效期届满先于生效；所有约束满足才允许共同生效（`all-members-ready-before-joint-activation`）。
+- 共同生效发出 `joint_group_started`（携带 `decision_id`），后续承诺可在 `cause` 中记录 `joint_decision_id`、`joint_group_id` 与事件序号，追溯它依赖的是哪一次共同决定；已开始的组与后续动作在存档恢复后都只发生一次。
+- 每个替代方案的成员等待条件、按参与者隔离的私有备注（`set_group_private_note`）与资源记录彼此独立；共同组随 `World.snapshot()`/`WorldArchive` 存档，在共同决定前后两个保存点继续运行都与连续运行逐条一致。
 
 ## 承诺
 
@@ -40,6 +47,45 @@ world.withdraw_commitment(commitment.commitment_id, by="alice")  # 仅生效前�
 world.update_commitment(commitment.commitment_id, params={"target": "south"})
 
 world.dispatch_due()  # 先结算到期，再生效到期的承诺并发出 commitment_started
+```
+
+## 共同生效承诺组
+
+```python
+group = world.request_joint_group(
+    action="Convoy",
+    members=[
+        {"actor_id": "carrier", "role": "supply", "action": "Deliver"},
+        {"actor_id": "gate", "role": "passage", "action": "OpenGate"},
+        {"actor_id": "receiver", "role": "receive", "action": "Receive"},
+    ],
+    resources=("route-a",),
+    requester_id="carrier",
+    valid_for=10,          # 整组有效期
+    member_valid_for=6,    # 可选：单个成员承诺的有效期
+    private_notes={"gate": {"code": "42"}},
+)
+
+world.joint_group_status(group.group_id)
+# {
+#   "state": "waiting", "waiting_on": ["carrier", "gate", "receiver"],
+#   "satisfied": [], "prepared_resources": ["route-a"], ...
+# }
+
+world.mark_joint_member_ready(group.group_id, "carrier")
+world.mark_joint_member_ready(group.group_id, "gate")
+world.dispatch_due()          # 仍在等 receiver，不会提前执行
+world.mark_joint_member_ready(group.group_id, "receiver")
+world.dispatch_due()          # 三方齐备，组共同生效，route-a 变为 held
+
+# 开始前撤回整组，或提出替代参与者的新方案（原组与撤回原因保留）
+world.withdraw_joint_group(group.group_id, by="gate", reason="maintenance")
+replacement = world.propose_joint_replacement(
+    group.group_id, action="Convoy", members=new_members,
+    resources=("route-b",), requester_id="carrier", reason="use spare gate",
+)
+
+world.complete_joint_group(group.group_id)  # 动作结束，释放资源
 ```
 
 ## 最小循环

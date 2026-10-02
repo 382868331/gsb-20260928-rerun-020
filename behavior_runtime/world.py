@@ -7,6 +7,7 @@ from typing import Any
 from .clock import Clock, VirtualClock
 from .commitments import Commitment, CommitmentLedger
 from .events import Event, EventBus
+from .groups import GroupMember, JointCommitmentGroup, JointGroupLedger
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +38,7 @@ class World:
         self._pending_actor_changes: dict[str, bool] = {}
         self._dispatching = False
         self.commitments = CommitmentLedger()
+        self.joint_groups = JointGroupLedger()
 
     def register_actor(self, actor_id: str) -> None:
         if self._dispatching:
@@ -53,6 +55,9 @@ class World:
         self._mailboxes.pop(actor_id, None)
         self.events.discard_actor_events(actor_id)
         self.commitments.end_for_actor(
+            actor_id, now=self.clock.now(), publish=self._publish_commitment_event
+        )
+        self.joint_groups.end_for_actor(
             actor_id, now=self.clock.now(), publish=self._publish_commitment_event
         )
 
@@ -89,6 +94,7 @@ class World:
                 for actor_id in self._actors
             },
             "commitments": self.commitments.snapshot(),
+            "joint_groups": self.joint_groups.snapshot(),
         }
 
     def restore(self, data: dict[str, Any]) -> None:
@@ -112,6 +118,7 @@ class World:
         for actor_id in self._actors:
             self._mailboxes.setdefault(actor_id, [])
         self.commitments.restore(deepcopy(data.get("commitments")))
+        self.joint_groups.restore(deepcopy(data.get("joint_groups")))
         for event_data in list(self.events.snapshot().get("scheduled", ())) + list(
             self.events.snapshot().get("due", ())
         ):
@@ -151,6 +158,9 @@ class World:
         self._batch_participants = tuple(self._actors)
         try:
             self.commitments.settle(
+                self.clock.now(), publish=self._publish_commitment_event
+            )
+            self.joint_groups.settle(
                 self.clock.now(), publish=self._publish_commitment_event
             )
             dispatched = self.events.dispatch_due(self.clock.now())
@@ -225,6 +235,144 @@ class World:
 
     def complete_commitment(self, commitment_id: str) -> bool:
         return self.commitments.complete(commitment_id, now=self.clock.now())
+
+    # ------------------------------------------------------------------
+    # Joint commitment groups
+    # ------------------------------------------------------------------
+
+    def request_joint_group(
+        self,
+        *,
+        action: str,
+        members: list[dict[str, Any] | tuple[str, str]],
+        resources: tuple[str, ...] | list[str] = (),
+        params: dict[str, Any] | None = None,
+        valid_for: float | None = None,
+        member_valid_for: float | None = None,
+        requester_id: str,
+        wait_reason: str = "joint-scheduled",
+        cause: dict[str, Any] | None = None,
+        private_notes: dict[str, dict[str, Any]] | None = None,
+    ) -> JointCommitmentGroup:
+        now = self.clock.now()
+        group_members = [self._build_member(m, now, member_valid_for) for m in members]
+        return self.joint_groups.request(
+            now=now,
+            action=action,
+            params=params,
+            members=group_members,
+            resources=tuple(resources),
+            valid_until=None if valid_for is None else now + valid_for,
+            requester_id=requester_id,
+            wait_reason=wait_reason,
+            cause=cause,
+            private_notes=private_notes,
+            publish=self._publish_commitment_event,
+        )
+
+    @staticmethod
+    def _build_member(
+        spec: dict[str, Any] | tuple[str, str],
+        now: float,
+        member_valid_for: float | None,
+    ) -> GroupMember:
+        if isinstance(spec, dict):
+            valid_for = spec.get("valid_for", member_valid_for)
+            return GroupMember(
+                actor_id=spec["actor_id"],
+                role=spec.get("role", "participant"),
+                action=spec["action"],
+                params=dict(spec.get("params") or {}),
+                valid_until=None if valid_for is None else now + valid_for,
+            )
+        actor_id, role = spec
+        return GroupMember(
+            actor_id=actor_id,
+            role=role,
+            action="",
+            valid_until=None if member_valid_for is None else now + member_valid_for,
+        )
+
+    def mark_joint_member_ready(
+        self,
+        group_id: str,
+        actor_id: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> bool:
+        return self.joint_groups.mark_ready(
+            group_id,
+            actor_id,
+            now=self.clock.now(),
+            params=params,
+            publish=self._publish_commitment_event,
+        )
+
+    def withdraw_joint_group(
+        self, group_id: str, *, by: str | None = None, reason: str | None = None
+    ) -> bool:
+        return self.joint_groups.withdraw(
+            group_id,
+            now=self.clock.now(),
+            by=by,
+            reason=reason,
+            publish=self._publish_commitment_event,
+        )
+
+    def propose_joint_replacement(
+        self,
+        old_group_id: str,
+        *,
+        action: str,
+        members: list[dict[str, Any] | tuple[str, str]],
+        resources: tuple[str, ...] | list[str] = (),
+        params: dict[str, Any] | None = None,
+        valid_for: float | None = None,
+        member_valid_for: float | None = None,
+        requester_id: str,
+        reason: str | None = None,
+        wait_reason: str = "joint-replacement",
+        cause: dict[str, Any] | None = None,
+        private_notes: dict[str, dict[str, Any]] | None = None,
+    ) -> JointCommitmentGroup:
+        now = self.clock.now()
+        group_members = [self._build_member(m, now, member_valid_for) for m in members]
+        return self.joint_groups.propose_replacement(
+            old_group_id,
+            now=now,
+            action=action,
+            params=params,
+            members=group_members,
+            resources=tuple(resources),
+            valid_until=None if valid_for is None else now + valid_for,
+            requester_id=requester_id,
+            reason=reason,
+            wait_reason=wait_reason,
+            cause=cause,
+            private_notes=private_notes,
+            publish=self._publish_commitment_event,
+        )
+
+    def complete_joint_group(self, group_id: str) -> bool:
+        return self.joint_groups.complete(
+            group_id, now=self.clock.now(), publish=self._publish_commitment_event
+        )
+
+    def joint_group_status(self, group_id: str) -> dict[str, Any]:
+        return self.joint_groups.get(group_id).status_view(self.joint_groups.resources)
+
+    def resource_status(self) -> list[dict[str, Any]]:
+        return self.joint_groups.resources.status()
+
+    def set_group_private_note(
+        self, group_id: str, actor_id: str, key: str, value: Any
+    ) -> None:
+        self.joint_groups.set_private_note(group_id, actor_id, key, value)
+
+    def get_group_private_note(
+        self, group_id: str, actor_id: str, key: str, default: Any = None
+    ) -> Any:
+        return self.joint_groups.get_private_note(group_id, actor_id, key, default)
 
     def _publish_commitment_event(
         self, event_type: str, payload: dict[str, Any], actor_id: str | None

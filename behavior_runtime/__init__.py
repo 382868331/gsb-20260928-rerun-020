@@ -13,6 +13,19 @@ from .commitments import (
     WITHDRAWN,
 )
 from .events import Event, EventBus
+from .groups import (
+    GROUP_ABANDONED,
+    GROUP_COMPLETED,
+    GROUP_EXPIRED,
+    GROUP_STARTED,
+    GROUP_SUPERSEDED,
+    GROUP_WAITING,
+    GROUP_WITHDRAWN,
+    GroupMember,
+    JointCommitmentGroup,
+    JointGroupLedger,
+    ResourceRegistry,
+)
 from .memory import Memory
 from .policy import Decision, KeepCurrent, StartAction, StopCurrent
 from .runtime import ActorRuntime, RuntimeSnapshot
@@ -33,6 +46,14 @@ __all__ = [
     "EventBus",
     "EXPIRED",
     "Fail",
+    "GROUP_ABANDONED",
+    "GROUP_COMPLETED",
+    "GROUP_EXPIRED",
+    "GROUP_STARTED",
+    "GROUP_SUPERSEDED",
+    "GROUP_WAITING",
+    "GROUP_WITHDRAWN",
+    "GroupMember",
     "KeepCurrent",
     "Memory",
     "Observation",
@@ -45,6 +66,8 @@ __all__ = [
     "World",
     "ActorRuntime",
     "RuntimeSnapshot",
+    "JointCommitmentGroup",
+    "JointGroupLedger",
     "WorldArchive",
     "BranchInfo",
 ]
