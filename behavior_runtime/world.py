@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .clock import Clock, VirtualClock
+from .commitments import Commitment, CommitmentLedger
 from .events import Event, EventBus
 
 
@@ -35,6 +36,7 @@ class World:
         self._batch_new_members: set[str] = set()
         self._pending_actor_changes: dict[str, bool] = {}
         self._dispatching = False
+        self.commitments = CommitmentLedger()
 
     def register_actor(self, actor_id: str) -> None:
         if self._dispatching:
@@ -50,6 +52,9 @@ class World:
         self._actors.pop(actor_id, None)
         self._mailboxes.pop(actor_id, None)
         self.events.discard_actor_events(actor_id)
+        self.commitments.end_for_actor(
+            actor_id, now=self.clock.now(), publish=self._publish_commitment_event
+        )
 
     def unregister_actor(self, actor_id: str) -> None:
         self.remove_actor(actor_id)
@@ -83,6 +88,7 @@ class World:
                 ]
                 for actor_id in self._actors
             },
+            "commitments": self.commitments.snapshot(),
         }
 
     def restore(self, data: dict[str, Any]) -> None:
@@ -105,6 +111,7 @@ class World:
         }
         for actor_id in self._actors:
             self._mailboxes.setdefault(actor_id, [])
+        self.commitments.restore(deepcopy(data.get("commitments")))
         for event_data in list(self.events.snapshot().get("scheduled", ())) + list(
             self.events.snapshot().get("due", ())
         ):
@@ -143,6 +150,9 @@ class World:
         self._dispatching = True
         self._batch_participants = tuple(self._actors)
         try:
+            self.commitments.settle(
+                self.clock.now(), publish=self._publish_commitment_event
+            )
             dispatched = self.events.dispatch_due(self.clock.now())
         finally:
             self._dispatching = False
@@ -158,6 +168,69 @@ class World:
         self._batch_participants = ()
         self._batch_new_members = set()
         return dispatched
+
+    def request_commitment(
+        self,
+        *,
+        requester_id: str,
+        performer_id: str,
+        action: str,
+        params: dict[str, Any] | None = None,
+        delay: float = 0.0,
+        valid_for: float | None = None,
+        wait_reason: str = "scheduled",
+        cause: dict[str, Any] | None = None,
+    ) -> Commitment:
+        now = self.clock.now()
+        return self.commitments.request(
+            now=now,
+            requester_id=requester_id,
+            performer_id=performer_id,
+            action=action,
+            params=params,
+            due_at=now + delay,
+            expires_at=None if valid_for is None else now + valid_for,
+            wait_reason=wait_reason,
+            cause=cause,
+            publish=self._publish_commitment_event,
+        )
+
+    def withdraw_commitment(self, commitment_id: str, *, by: str | None = None) -> bool:
+        return self.commitments.withdraw(
+            commitment_id,
+            now=self.clock.now(),
+            by=by,
+            publish=self._publish_commitment_event,
+        )
+
+    def update_commitment(
+        self,
+        commitment_id: str,
+        *,
+        by: str | None = None,
+        params: dict[str, Any] | None = None,
+        delay: float | None = None,
+        valid_for: float | None = None,
+    ) -> bool:
+        now = self.clock.now()
+        return self.commitments.update(
+            commitment_id,
+            now=now,
+            by=by,
+            params=params,
+            due_at=None if delay is None else now + delay,
+            expires_at=None if valid_for is None else now + valid_for,
+            publish=self._publish_commitment_event,
+        )
+
+    def complete_commitment(self, commitment_id: str) -> bool:
+        return self.commitments.complete(commitment_id, now=self.clock.now())
+
+    def _publish_commitment_event(
+        self, event_type: str, payload: dict[str, Any], actor_id: str | None
+    ) -> int:
+        event = self.publish(event_type, payload, actor_id=actor_id)
+        return event.sequence
 
     def _apply_pending_actor_changes(self) -> None:
         while self._pending_actor_changes:

@@ -16,6 +16,31 @@
 - `WorldArchive.capture()` 会同时保存世界状态、时钟、未投递事件、每个角色尚未消费的邮箱、当前动作等待、私有记忆和决策历史。
 - 多次 `WorldArchive.restore()` 得到互不共享可写对象的分支；延迟事件仍携带原 `run_id`，旧动作结果迟到时继续计入 `stale_results_ignored`。
 - 分支元数据记录当前 checkpoint 和父 checkpoint，可追溯分支起点；决策历史包含动作配置，可比较同一起点后哪些决策改变。
+- `World.request_commitment(...)` 登记带 `delay` 与 `valid_for` 有效期的承诺；到期前可用 `withdraw_commitment` 撤回或用 `update_commitment` 改条件，只有 `waiting` 状态的承诺可被撤回或修改。
+- 承诺的 `waiting` 与 `started` 状态严格分开：开始执行后撤回只会记录一条 `withdrawal_rejected`，不会抹掉已发生的行为；同一承诺只会生效一次，重复结算不会重复触发。
+- 同一时刻冲突按固定规则结算并逐条记录在承诺的 `history` 里：显式撤回与角色离开先于结算（`explicit-withdrawal-precedes-settlement`、`participant-removal-precedes-settlement`），结算内部到期先于生效（`expiry-precedes-activation`），已开始的承诺不可撤回（`started-commitments-cannot-be-withdrawn`）。
+- 承诺可携带 `cause`（来源事件序号、父承诺 id、原因）与 `wait_reason`；生效、撤回、到期等事件序号都写入 `history`，可沿记录从动作追溯到原请求。
+- 角色离开世界时，其参与的等待中或已开始的承诺以 `participant_lost:<actor_id>` 结束原因关闭，历史保留。
+- 承诺随 `World.snapshot()` 一起存入存档；从同一存档派生的分支承诺与私有记忆互不影响，恰在到期或移除前保存后继续运行与连续运行逐条一致。
+
+## 承诺
+
+```python
+commitment = world.request_commitment(
+    requester_id="alice",
+    performer_id="bob",
+    action="MoveToTarget",
+    params={"target": "north"},
+    delay=5,        # 5 秒后生效
+    valid_for=10,   # 10 秒后失效
+    cause={"event_sequence": 3, "reason": "alice 的请求"},
+)
+
+world.withdraw_commitment(commitment.commitment_id, by="alice")  # 仅生效前有效
+world.update_commitment(commitment.commitment_id, params={"target": "south"})
+
+world.dispatch_due()  # 先结算到期，再生效到期的承诺并发出 commitment_started
+```
 
 ## 最小循环
 
