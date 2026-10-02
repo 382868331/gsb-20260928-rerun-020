@@ -22,6 +22,12 @@
 - 承诺可携带 `cause`（来源事件序号、父承诺 id、原因）与 `wait_reason`；生效、撤回、到期等事件序号都写入 `history`，可沿记录从动作追溯到原请求。
 - 角色离开世界时，其参与的等待中或已开始的承诺以 `participant_lost:<actor_id>` 结束原因关闭，历史保留。
 - 承诺随 `World.snapshot()` 一起存入存档；从同一存档派生的分支承诺与私有记忆互不影响，恰在到期或移除前保存后继续运行与连续运行逐条一致。
+- `World.request_joint_commitment(...)` 登记共同生效的承诺组合：只有全部参与者的承诺都在等待且到期、且共享资源能一次性占得时，组合动作才生效；单个成员到期或准备好不会提前触发。
+- `World.joint_status(group_id)` 报告仍在等待谁（`waiting_on`）、哪些约束已满足（`satisfied`）以及准备占用的共享资源与当前占用者。
+- 组合生效时分配 `decision_id` 并随 `joint_commitment_started` 事件发出；后续承诺用 `cause` 记录依赖的是哪一次共同决定。已开始组合不能撤回或回到预约状态。
+- 开始前参与者可经 `withdraw_joint_commitment(...)` 放弃整组，或用 `replacement` 提出替代方案；原组合、原承诺与撤回原因全部保留，新方案通过 `cause["supersedes"]` 指回原组合。
+- 争用同一资源的组合按 `earliest-request-wins-resource` 规则结算，先登记者生效，其余记录 `activation_deferred` 且不持有任何占用；组合完成、到期或参与者离开时同一时刻释放资源，结算前还会清理任何遗留占用。
+- 组合的到期、参与者离开与资源释放在同一次 `dispatch_due()` 中核对；组合随存档保存，共同决定前后的保存点恢复后动作与后续承诺只发生一次，不同替代方案分支的私有记忆、等待条件与资源记录彼此独立。
 
 ## 承诺
 

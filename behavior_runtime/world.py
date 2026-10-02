@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .clock import Clock, VirtualClock
-from .commitments import Commitment, CommitmentLedger
+from .commitments import Commitment, CommitmentLedger, JointCommitment
 from .events import Event, EventBus
 
 
@@ -225,6 +225,56 @@ class World:
 
     def complete_commitment(self, commitment_id: str) -> bool:
         return self.commitments.complete(commitment_id, now=self.clock.now())
+
+    def request_joint_commitment(
+        self,
+        *,
+        requester_id: str,
+        action: str,
+        participants: list[dict[str, Any]],
+        params: dict[str, Any] | None = None,
+        resources: tuple[str, ...] = (),
+        wait_reason: str = "scheduled",
+        cause: dict[str, Any] | None = None,
+    ) -> JointCommitment:
+        return self.commitments.request_joint(
+            now=self.clock.now(),
+            requester_id=requester_id,
+            action=action,
+            participants=participants,
+            params=params,
+            resources=resources,
+            wait_reason=wait_reason,
+            cause=cause,
+            publish=self._publish_commitment_event,
+        )
+
+    def withdraw_joint_commitment(
+        self,
+        group_id: str,
+        *,
+        by: str | None = None,
+        reason: str | None = None,
+        replacement: dict[str, str] | None = None,
+    ) -> JointCommitment | None:
+        return self.commitments.withdraw_joint(
+            group_id,
+            now=self.clock.now(),
+            by=by,
+            reason=reason,
+            replacement=replacement,
+            publish=self._publish_commitment_event,
+        )
+
+    def complete_joint_commitment(self, group_id: str) -> bool:
+        return self.commitments.complete_joint(
+            group_id,
+            now=self.clock.now(),
+            publish=self._publish_commitment_event,
+        )
+
+    def joint_status(self, group_id: str) -> dict[str, Any]:
+        return self.commitments.joint_status(group_id, now=self.clock.now())
 
     def _publish_commitment_event(
         self, event_type: str, payload: dict[str, Any], actor_id: str | None

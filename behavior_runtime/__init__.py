@@ -6,6 +6,7 @@ from .clock import Clock, VirtualClock
 from .commitments import (
     Commitment,
     CommitmentLedger,
+    JointCommitment,
     ENDED,
     EXPIRED,
     STARTED,
@@ -33,6 +34,7 @@ __all__ = [
     "EventBus",
     "EXPIRED",
     "Fail",
+    "JointCommitment",
     "KeepCurrent",
     "Memory",
     "Observation",
