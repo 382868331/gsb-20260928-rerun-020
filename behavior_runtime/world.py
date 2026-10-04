@@ -249,6 +249,66 @@ class World:
             publish=self._publish_commitment_event,
         )
 
+    def request_phased_joint_commitment(
+        self,
+        *,
+        requester_id: str,
+        action: str,
+        participants: list[dict[str, Any]],
+        phases: tuple[str, ...] = ("prepare", "execute", "handover"),
+        phase_resources: dict[str, tuple[str, ...]] | None = None,
+        params: dict[str, Any] | None = None,
+        wait_reason: str = "scheduled",
+        cause: dict[str, Any] | None = None,
+    ) -> JointCommitment:
+        """Register a joint task whose phases negotiate resources separately.
+
+        Each participant may pass a phases mapping with a per-phase delay and
+        valid_for. Readiness for an earlier phase never occupies the
+        resources requested by later phases.
+        """
+        return self.commitments.request_joint(
+            now=self.clock.now(),
+            requester_id=requester_id,
+            action=action,
+            participants=participants,
+            params=params,
+            resources=(),
+            wait_reason=wait_reason,
+            cause=cause,
+            publish=self._publish_commitment_event,
+            phases=phases,
+            phase_resources=phase_resources,
+        )
+
+    def finish_joint_phase(
+        self, group_id: str, phase_id: str | None = None
+    ) -> JointCommitment | None:
+        return self.commitments.finish_phase(
+            group_id, phase_id, now=self.clock.now(),
+            publish=self._publish_commitment_event,
+        )
+
+    def cancel_joint_phase(
+        self,
+        group_id: str,
+        phase_id: str,
+        *,
+        by: str | None = None,
+        reason: str | None = None,
+    ) -> JointCommitment | None:
+        return self.commitments.cancel_phase(
+            group_id,
+            phase_id,
+            now=self.clock.now(),
+            by=by,
+            reason=reason,
+            publish=self._publish_commitment_event,
+        )
+
+    def diagnose_joint_waits(self) -> dict[str, Any]:
+        return self.commitments.diagnose_waits(now=self.clock.now())
+
     def withdraw_joint_commitment(
         self,
         group_id: str,

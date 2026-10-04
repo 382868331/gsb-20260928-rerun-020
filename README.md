@@ -28,6 +28,10 @@
 - 开始前参与者可经 `withdraw_joint_commitment(...)` 放弃整组，或用 `replacement` 提出替代方案；原组合、原承诺与撤回原因全部保留，新方案通过 `cause["supersedes"]` 指回原组合。
 - 争用同一资源的组合按 `earliest-request-wins-resource` 规则结算，先登记者生效，其余记录 `activation_deferred` 且不持有任何占用；组合完成、到期或参与者离开时同一时刻释放资源，结算前还会清理任何遗留占用。
 - 组合的到期、参与者离开与资源释放在同一次 `dispatch_due()` 中核对；组合随存档保存，共同决定前后的保存点恢复后动作与后续承诺只发生一次，不同替代方案分支的私有记忆、等待条件与资源记录彼此独立。
+- `World.request_phased_joint_commitment(...)` 把联合任务拆成有序阶段（默认 `prepare`、`execute`、`handover`，可自定义）：每个阶段单独声明资源、单独等待成员就绪；成员在准备阶段就绪不代表占用执行或交接阶段的资源，阶段资源只在该阶段活动期间持有，`finish_joint_phase(...)` 后立即释放。
+- `joint_status(group_id)` 的 `waiting_for` 逐项解释当前在等谁（成员角色、最早可用时刻）或等哪个资源（占用方分组与阶段）；`diagnose_joint_waits()` 输出跨分组的 waits-for 图、边与 `cycles`，两个任务互相等待对方下一阶段资源时可直接看到环，而不是静默卡住。
+- `cancel_joint_phase(group_id, phase_id, ...)` 只取消尚未开始的阶段及其后续阶段；已完成或正在执行的阶段、成员说明与事件全部保留，活动阶段的资源仍持有到该阶段正常结束。取消一方未开始的阶段后，其被孤立的占用在下一次 `dispatch_due()` 回收，另一方即可继续。
+- 每个成员每个阶段各有一条就绪承诺（可分别给 `delay`/`valid_for`），阶段开始发出 `joint_phase_started` 并附带成员说明，阶段结束发出 `joint_phase_finished`；阶段状态、资源承诺、成员说明随世界存档保存，重开后已执行事件不会重复触发，恢复出的分支与原世界互不影响。
 
 ## 承诺
 
@@ -98,6 +102,35 @@ assert follow_up.branch.parent_checkpoint_id == "waiting-at-t1"
 策略对象通常不可序列化，因此恢复时需要由宿主程序重新提供；动作仍通过持久化的 `action_name` 和 `to_config()` 数据重建。
 
 持久化动作需要实现 `to_config()` 和 `from_config()`，并在运行时构造时通过 `action_types` 注册。新增感知模块或更复杂行为时可以继续使用同一个动作接口；感知结果进入观察或动作上下文即可，不需要改变动作的基本状态约定。
+
+
+## 分阶段联合任务
+
+```python
+group = world.request_phased_joint_commitment(
+    requester_id="alice",
+    action="TransferCargo",
+    participants=[
+        {"role": "carrier", "performer_id": "bob",
+         "phases": {"prepare": {"delay": 1}, "execute": {"delay": 2},
+                    "handover": {"delay": 1}}},
+        {"role": "gatekeeper", "performer_id": "carol",
+         "phases": {"prepare": {"delay": 1}, "execute": {"delay": 4},
+                    "handover": {"delay": 1}}},
+    ],
+    phase_resources={"prepare": ("briefing",), "execute": ("bridge",),
+                     "handover": ("dock",)},
+)
+
+world.dispatch_due()                   # 成员到期后进入 prepare，只占 briefing
+world.finish_joint_phase(group.group_id, "prepare")
+world.dispatch_due()                   # 释放 briefing，成员就绪后占 bridge 进入 execute
+
+status = world.joint_status(group.group_id)
+status["waiting_for"]                  # 解释在等哪些成员或哪个资源（含占用方阶段）
+world.diagnose_joint_waits()           # 跨分组等待图与死锁环 cycles
+world.cancel_joint_phase(group.group_id, "handover", by="bob")  # 已完成阶段不受影响
+```
 
 ## 测试
 
