@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from .clock import Clock, VirtualClock
-from .commitments import Commitment, CommitmentLedger, JointCommitment
+from .commitments import (
+    Commitment,
+    CommitmentLedger,
+    JointCommitment,
+    PhasedJointTask,
+)
 from .events import Event, EventBus
 
 
@@ -275,6 +280,57 @@ class World:
 
     def joint_status(self, group_id: str) -> dict[str, Any]:
         return self.commitments.joint_status(group_id, now=self.clock.now())
+
+    def request_joint_task(
+        self,
+        *,
+        requester_id: str,
+        action: str,
+        phases: list[dict[str, Any]],
+        params: dict[str, Any] | None = None,
+        wait_reason: str = "scheduled",
+        cause: dict[str, Any] | None = None,
+    ) -> PhasedJointTask:
+        return self.commitments.request_phased(
+            now=self.clock.now(),
+            requester_id=requester_id,
+            action=action,
+            phases=phases,
+            params=params,
+            wait_reason=wait_reason,
+            cause=cause,
+            publish=self._publish_commitment_event,
+        )
+
+    def complete_joint_phase(self, task_id: str) -> bool:
+        return self.commitments.complete_phase(
+            task_id,
+            now=self.clock.now(),
+            publish=self._publish_commitment_event,
+        )
+
+    def cancel_joint_phase(
+        self,
+        task_id: str,
+        phase: int | str | None = None,
+        *,
+        by: str | None = None,
+        reason: str | None = None,
+    ) -> bool:
+        return self.commitments.cancel_phase(
+            task_id,
+            phase,
+            now=self.clock.now(),
+            by=by,
+            reason=reason,
+            publish=self._publish_commitment_event,
+        )
+
+    def joint_task_status(self, task_id: str) -> dict[str, Any]:
+        return self.commitments.task_status(task_id, now=self.clock.now())
+
+    def detect_joint_wait_cycles(self) -> list[dict[str, Any]]:
+        return self.commitments.detect_wait_cycles(now=self.clock.now())
 
     def _publish_commitment_event(
         self, event_type: str, payload: dict[str, Any], actor_id: str | None

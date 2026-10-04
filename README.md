@@ -28,6 +28,11 @@
 - 开始前参与者可经 `withdraw_joint_commitment(...)` 放弃整组，或用 `replacement` 提出替代方案；原组合、原承诺与撤回原因全部保留，新方案通过 `cause["supersedes"]` 指回原组合。
 - 争用同一资源的组合按 `earliest-request-wins-resource` 规则结算，先登记者生效，其余记录 `activation_deferred` 且不持有任何占用；组合完成、到期或参与者离开时同一时刻释放资源，结算前还会清理任何遗留占用。
 - 组合的到期、参与者离开与资源释放在同一次 `dispatch_due()` 中核对；组合随存档保存，共同决定前后的保存点恢复后动作与后续承诺只发生一次，不同替代方案分支的私有记忆、等待条件与资源记录彼此独立。
+- `World.request_joint_task(...)` 把联合任务拆成有序阶段（默认 `prepare`/`execute`/`handoff`），每阶段声明各自的参与者与资源；资源只在进入该阶段、且实际可占得时才登记占用，成员准备完成不会提前占用未来阶段的资源。
+- 进入后续阶段前按 `phase-entry-requires-available-resources` 核对实际可用性；占不到时记录 `joint_phase_deferred` 并在 `joint_task_status(...)` 的 `blocked_resources` 里说明等待的是哪份资源、当前被谁持有。
+- `World.detect_joint_wait_cycles()` 沿“任务等待的资源被另一任务持有”的边诊断循环等待，返回环上每个任务等待的资源与持有者。
+- `World.cancel_joint_phase(...)` 只取消未开始的阶段及其后续阶段：已完成阶段与其事件全部保留（`phase-cancellation-preserves-completed-work`），任务转为 `cancelled` 并释放仍持有的资源，等待这些资源的其他任务随后可继续。
+- 阶段任务随 `World.snapshot()` 存入存档；恢复后等待状态、资源占用、已执行阶段与成员说明保持一致，同一阶段不会重复生效。
 
 ## 承诺
 
