@@ -30,7 +30,7 @@
 - 组合的到期、参与者离开与资源释放在同一次 `dispatch_due()` 中核对；组合随存档保存，共同决定前后的保存点恢复后动作与后续承诺只发生一次，不同替代方案分支的私有记忆、等待条件与资源记录彼此独立。
 - `World.request_phased_joint_commitment(...)` 把联合任务拆成有序阶段（默认 `prepare`、`execute`、`handover`，可自定义）：每个阶段单独声明资源、单独等待成员就绪；成员在准备阶段就绪不代表占用执行或交接阶段的资源，阶段资源只在该阶段活动期间持有，`finish_joint_phase(...)` 后立即释放。
 - `joint_status(group_id)` 的 `waiting_for` 逐项解释当前在等谁（成员角色、最早可用时刻）或等哪个资源（占用方分组与阶段）；`diagnose_joint_waits()` 输出跨分组的 waits-for 图、边与 `cycles`，两个任务互相等待对方下一阶段资源时可直接看到环，而不是静默卡住。
-- `cancel_joint_phase(group_id, phase_id, ...)` 只取消尚未开始的阶段及其后续阶段；已完成或正在执行的阶段、成员说明与事件全部保留，活动阶段的资源仍持有到该阶段正常结束。取消一方未开始的阶段后，其被孤立的占用在下一次 `dispatch_due()` 回收，另一方即可继续。
+- `cancel_joint_phase(group_id, phase_id, ...)` 只取消尚未开始的阶段及其后续阶段；已完成或正在执行的阶段、成员说明与事件全部保留。已开始阶段的处理规则固定为 `active-phase-runs-to-safe-end`：正在执行的阶段不被中途拆除，任务保持 `started` 并记录 `ending_reason`，活动阶段资源继续持有，直到 `finish_joint_phase(...)` 让其安全结束并释放资源，任务随即以取消原因 `ended` 收尾（发出 `joint_commitment_ended`）；若取消时没有活动阶段，任务立即 `ended`。因此任何占用都有明确的释放路径，全局资源表与 `joint_status` 的 `held_resources`/`ending_reason` 始终一致；重复取消或重复派发只记录一条拒绝历史，不产生新事件也不泄漏占用。
 - 每个成员每个阶段各有一条就绪承诺（可分别给 `delay`/`valid_for`），阶段开始发出 `joint_phase_started` 并附带成员说明，阶段结束发出 `joint_phase_finished`；阶段状态、资源承诺、成员说明随世界存档保存，重开后已执行事件不会重复触发，恢复出的分支与原世界互不影响。
 
 ## 承诺

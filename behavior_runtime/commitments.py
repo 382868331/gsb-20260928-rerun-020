@@ -28,6 +28,7 @@ RULE_MEMBER_EXPIRY_ENDS_GROUP = "member-expiry-ends-joint-group"
 RULE_RESOURCE_PRIORITY = "earliest-request-wins-resource"
 RULE_PHASE_SEQUENCE = "phases-start-in-order"
 RULE_FINISHED_WORK_IMMUTABLE = "finished-phases-cannot-be-cancelled"
+RULE_ACTIVE_PHASE_SAFE_END = "active-phase-runs-to-safe-end"
 
 # Default phase ordering for a phased joint task.
 PHASE_PREPARE = "prepare"
@@ -542,6 +543,12 @@ class CommitmentLedger:
         that are completed or still active stay exactly as they were, and
         resources held by an active phase remain held until that phase is
         finished. This operation can never revoke already finished work.
+
+        An already running phase is never torn down mid-flight: it runs to
+        a safe end (RULE_ACTIVE_PHASE_SAFE_END). The group stays STARTED
+        with ending_reason set, and only ends once finish_phase releases
+        the active phase's resources. Repeating the cancellation is a
+        no-op that only records a rejection in the history.
         """
         group = self.get_group(group_id)
         if phase_id not in group.phases:
@@ -572,13 +579,17 @@ class CommitmentLedger:
             if group.phase_state.get(later_id, WAITING) == WAITING:
                 group.phase_state[later_id] = CANCELLED
                 cancelled.append(later_id)
-        group.state = ENDED
-        group.end_reason = f"phase_cancelled:{phase_id}"
+        end_reason = f"phase_cancelled:{phase_id}"
         if reason:
-            group.end_reason += f":{reason}"
+            end_reason += f":{reason}"
+        active = group.active_phase
         detail = {"by": by, "reason": reason, "phase_id": phase_id,
                    "cancelled_phases": cancelled,
-                   "preserved_phases": list(group.phases[:target_index])}
+                   "preserved_phases": list(group.phases[:target_index]),
+                   "active_phase": active,
+                   "active_phase_rule": (
+                       RULE_ACTIVE_PHASE_SAFE_END if active is not None else None
+                   )}
         sequence = self._emit_joint(publish, "joint_phase_cancelled", group, now,
                                     extra=detail)
         group.record(now, "phase_cancelled", rule=RULE_FINISHED_WORK_IMMUTABLE,
@@ -594,7 +605,21 @@ class CommitmentLedger:
                     commitment.record(now, "cancelled",
                                        detail={"phase_id": later_id, "by": by},
                                        event_sequence=sequence)
-        if group.active_phase is None:
+        if active is not None:
+            # The running phase keeps its resources and continues to a safe
+            # end: the group stays STARTED and only ends when finish_phase
+            # releases the active phase. This is the single explicit rule
+            # for already-started work, so no hold is ever left without an
+            # operation that can release it.
+            group.ending_reason = end_reason
+            group.record(now, "active_phase_continues",
+                          rule=RULE_ACTIVE_PHASE_SAFE_END,
+                          detail={"phase_id": active,
+                                  "ending_reason": end_reason},
+                          event_sequence=sequence)
+        else:
+            group.state = ENDED
+            group.end_reason = end_reason
             self._release_group_holds(group, now)
         return group
 
@@ -643,11 +668,22 @@ class CommitmentLedger:
         self._release_phase_holds(group, active, now)
         group.active_phase = None
         if group.next_phase() is None:
-            group.state = COMPLETED
-            group.end_reason = "completed"
-            sequence = self._emit_joint(publish, "joint_commitment_completed",
-                                        group, now)
-            group.record(now, "completed", event_sequence=sequence)
+            if group.ending_reason is not None:
+                group.state = ENDED
+                group.end_reason = group.ending_reason
+                sequence = self._emit_joint(
+                    publish, "joint_commitment_ended", group, now,
+                    extra={"end_reason": group.ending_reason},
+                )
+                group.record(now, "ended", rule=RULE_ACTIVE_PHASE_SAFE_END,
+                              detail={"end_reason": group.ending_reason},
+                              event_sequence=sequence)
+            else:
+                group.state = COMPLETED
+                group.end_reason = "completed"
+                sequence = self._emit_joint(publish, "joint_commitment_completed",
+                                            group, now)
+                group.record(now, "completed", event_sequence=sequence)
         return group
 
     def complete_joint(self, group_id: str, *, now: float,
@@ -785,6 +821,11 @@ class CommitmentLedger:
             for resource, holder in self._resource_holds.items()
             if resource in requested and holder[0] != group.group_id
         }
+        own_holds = {
+            resource: holder[1]
+            for resource, holder in self._resource_holds.items()
+            if holder[0] == group.group_id
+        }
         waiting_for = self._wait_description(
             group, target_phase, now,
             phase_waiting if group.phased else waiting_on,
@@ -797,6 +838,7 @@ class CommitmentLedger:
             "action": group.action,
             "active_phase": group.active_phase,
             "next_phase": group.next_phase(),
+            "ending_reason": group.ending_reason,
             "members": members,
             "phases": phases_report,
             "waiting_on": waiting_on,
@@ -808,6 +850,7 @@ class CommitmentLedger:
                 for phase_id, resources in group.phase_resources.items()
             },
             "resource_holds": resource_holds,
+            "held_resources": own_holds,
         }
 
     def _phase_status(
@@ -897,7 +940,20 @@ class CommitmentLedger:
                   )}
             )
         if not description and group.state == STARTED and target_phase is None:
-            description.append({"kind": "nothing", "reason": "所有阶段均已完成"})
+            if group.active_phase is not None:
+                reason = f"阶段 {group.active_phase} 正在执行，将运行到安全结束"
+                if group.ending_reason:
+                    reason += f"，随后任务以 {group.ending_reason} 结束"
+                description.append({
+                    "kind": "active_phase",
+                    "phase_id": group.active_phase,
+                    "rule": RULE_ACTIVE_PHASE_SAFE_END,
+                    "reason": reason,
+                })
+            else:
+                description.append(
+                    {"kind": "nothing", "reason": "所有阶段均已完成"}
+                )
         return description
 
     def diagnose_waits(self, *, now: float) -> dict[str, Any]:
@@ -1447,6 +1503,7 @@ class JointCommitment:
     decision_id: str | None = None
     end_reason: str | None = None
     started_at: float | None = None
+    ending_reason: str | None = None
     phases: tuple[str, ...] = (PHASE_EXECUTE,)
     phase_resources: dict[str, tuple[str, ...]] = field(default_factory=dict)
     phase_state: dict[str, str] = field(default_factory=dict)
@@ -1506,6 +1563,7 @@ class JointCommitment:
             "decision_id": self.decision_id,
             "end_reason": self.end_reason,
             "started_at": self.started_at,
+            "ending_reason": self.ending_reason,
             "phases": list(self.phases),
             "phase_resources": {
                 phase_id: list(resources)
@@ -1536,6 +1594,7 @@ class JointCommitment:
             decision_id=values.get("decision_id"),
             end_reason=values.get("end_reason"),
             started_at=values.get("started_at"),
+            ending_reason=values.get("ending_reason"),
             phases=tuple(values.get("phases", (PHASE_EXECUTE,))),
             phase_resources={
                 phase_id: tuple(resources)

@@ -15,6 +15,7 @@ from behavior_runtime.commitments import (
     PHASE_PREPARE,
     STARTED,
     WAITING,
+    RULE_ACTIVE_PHASE_SAFE_END,
     RULE_FINISHED_WORK_IMMUTABLE,
     RULE_PHASE_SEQUENCE,
     RULE_RESOURCE_PRIORITY,
@@ -223,8 +224,11 @@ def test_cancel_unstarted_phase_breaks_cycle_without_undoing_finished_work():
         g2.group_id, PHASE_HANDOVER, by="b1", reason="交接取消"
     )
     assert result is g2
-    assert g2.state == ENDED
-    assert g2.end_reason == f"phase_cancelled:{PHASE_HANDOVER}:交接取消"
+    # The running execute phase is not torn down: g2 stays STARTED and keeps
+    # its execute hold until the phase is finished safely.
+    assert g2.state == STARTED
+    assert g2.ending_reason == f"phase_cancelled:{PHASE_HANDOVER}:交接取消"
+    assert g2.end_reason is None
     # Completed/active phases stay recorded: cancellation does not undo work.
     assert g2.phase_state[PHASE_PREPARE] == COMPLETED
     assert g2.phase_state[PHASE_EXECUTE] == STARTED
@@ -235,16 +239,54 @@ def test_cancel_unstarted_phase_breaks_cycle_without_undoing_finished_work():
     assert cancelled_event[0].payload["preserved_phases"] == [
         PHASE_PREPARE, PHASE_EXECUTE,
     ]
+    assert cancelled_event[0].payload["active_phase"] == PHASE_EXECUTE
+    assert cancelled_event[0].payload["active_phase_rule"] == (
+        RULE_ACTIVE_PHASE_SAFE_END
+    )
+
+    # Global table and the task's own view report the same hold.
+    holds = world.commitments.resource_holds()
+    assert holds == {"X": g1.group_id, "Y": g2.group_id, "Z": g3.group_id}
+    g2_status = world.joint_status(g2.group_id)
+    assert g2_status["held_resources"] == {"Y": PHASE_EXECUTE}
+    assert g2_status["ending_reason"] == g2.ending_reason
+    active_wait = [w for w in g2_status["waiting_for"]
+                   if w["kind"] == "active_phase"]
+    assert active_wait and active_wait[0]["rule"] == RULE_ACTIVE_PHASE_SAFE_END
+    # The waiting task learns the same fact about who holds Y.
+    g1_status = world.joint_status(g1.group_id)
+    y_wait = [w for w in g1_status["waiting_for"]
+              if w["kind"] == "resource" and w["resource"] == "Y"]
+    assert y_wait[0]["held_by_group"] == g2.group_id
+    assert y_wait[0]["held_by_phase"] == PHASE_EXECUTE
+
+    # Repeating the cancellation or re-dispatching adds no events and
+    # changes no holds.
+    again = world.cancel_joint_phase(g2.group_id, PHASE_HANDOVER, by="b1")
+    assert again is None
+    event_count = len(seen)
+    world.dispatch_due()
+    assert len(seen) == event_count
+    assert world.commitments.resource_holds() == holds
 
     # Cannot cancel a phase that already ran.
-    again = world.cancel_joint_phase(g2.group_id, PHASE_PREPARE, by="b1")
-    assert again is None
+    rejected = world.cancel_joint_phase(g2.group_id, PHASE_PREPARE, by="b1")
+    assert rejected is None
     reject = [h for h in g2.history if h["kind"] == "phase_cancel_rejected"]
     assert reject[-1]["rule"] == RULE_FINISHED_WORK_IMMUTABLE
 
+    # g2's execute phase runs to its safe end, releasing Y exactly once;
+    # only then does the group end with the recorded cancellation reason.
+    world.finish_joint_phase(g2.group_id, PHASE_EXECUTE)
+    assert g2.state == ENDED
+    assert g2.end_reason == f"phase_cancelled:{PHASE_HANDOVER}:交接取消"
+    assert g2.active_phase is None
+    assert "Y" not in world.commitments.resource_holds()
     world.dispatch_due()
-    # g2's stranded execute hold is reclaimed; g1's handover now proceeds.
-    assert g1.active_phase == PHASE_EXECUTE
+    ended_events = [e for e in seen if e.type == "joint_commitment_ended"
+                    and e.payload["group_id"] == g2.group_id]
+    assert len(ended_events) == 1
+
     world.finish_joint_phase(g1.group_id, PHASE_EXECUTE)
     world.dispatch_due()
     assert g1.active_phase == PHASE_HANDOVER
@@ -289,9 +331,16 @@ def test_restored_wait_state_keeps_promises_events_and_notes_without_rerun():
     restored.dispatch_due()
     assert [e.type for e in restored_seen] == []
 
-    # Cancelling on the restored branch unblocks the other group exactly once.
+    # Cancelling on the restored branch keeps the active phase running to
+    # its safe end; finishing it unblocks the other group exactly once.
     restored.cancel_joint_phase(r2.group_id, PHASE_HANDOVER, by="b1")
+    assert r2.state == STARTED
+    assert r2.ending_reason == f"phase_cancelled:{PHASE_HANDOVER}"
     restored.dispatch_due()
+    assert restored.commitments.resource_holds()["Y"] == r2.group_id
+    restored.finish_joint_phase(r2.group_id, PHASE_EXECUTE)
+    assert r2.state == ENDED
+    assert r2.end_reason == f"phase_cancelled:{PHASE_HANDOVER}"
     restored.finish_joint_phase(r1.group_id, PHASE_EXECUTE)
     restored.dispatch_due()
     assert r1.active_phase == PHASE_HANDOVER
@@ -312,3 +361,150 @@ def test_restored_wait_state_keeps_promises_events_and_notes_without_rerun():
     assert world.commitments.resource_holds()["X"] == g1.group_id
     assert pre_started  # original history still intact
     assert restored_runtimes["a1"].world is restored
+
+def reach_execute(world, group):
+    world.dispatch_due()
+    assert group.active_phase == PHASE_PREPARE
+    world.finish_joint_phase(group.group_id, PHASE_PREPARE)
+    world.dispatch_due()
+    assert group.active_phase == PHASE_EXECUTE
+
+
+def test_cancel_after_prepare_finished_ends_group_with_no_holds():
+    world, _ = make_world()
+    seen = track_events(world)
+    group = request_phased(
+        world, "a1", ("a1", "a2"),
+        {PHASE_PREPARE: ("briefing",), PHASE_EXECUTE: ("bridge",),
+         PHASE_HANDOVER: ("dock",)},
+    )
+    world.dispatch_due()
+    world.finish_joint_phase(group.group_id, PHASE_PREPARE)
+    # Prepare is done, execute has not started: nothing is held.
+    assert world.commitments.resource_holds() == {}
+
+    result = world.cancel_joint_phase(
+        group.group_id, PHASE_EXECUTE, by="a1", reason="计划变更"
+    )
+    assert result is group
+    assert group.state == ENDED
+    assert group.end_reason == f"phase_cancelled:{PHASE_EXECUTE}:计划变更"
+    assert group.ending_reason is None
+    assert group.phase_state[PHASE_PREPARE] == COMPLETED
+    assert group.phase_state[PHASE_EXECUTE] == CANCELLED
+    assert group.phase_state[PHASE_HANDOVER] == CANCELLED
+    assert world.commitments.resource_holds() == {}
+
+    world.dispatch_due()
+    cancelled = [e for e in seen if e.type == "joint_phase_cancelled"]
+    assert len(cancelled) == 1
+    assert cancelled[0].payload["cancelled_phases"] == [
+        PHASE_EXECUTE, PHASE_HANDOVER,
+    ]
+    assert cancelled[0].payload["active_phase"] is None
+
+    # Repeated cancellation and repeated dispatch add no events.
+    assert world.cancel_joint_phase(group.group_id, PHASE_EXECUTE) is None
+    event_count = len(seen)
+    world.dispatch_due()
+    world.dispatch_due()
+    assert len(seen) == event_count
+    # Member history of the finished phase is preserved.
+    kinds = {h["kind"] for h in group.history}
+    assert "phase_finished" in kinds and "phase_cancelled" in kinds
+
+
+def test_cancel_while_handover_waiting_preserves_finished_execute():
+    world, _ = make_world()
+    seen = track_events(world)
+    group = request_phased(
+        world, "a1", ("a1", "a2"),
+        {PHASE_PREPARE: (), PHASE_EXECUTE: ("bridge",),
+         PHASE_HANDOVER: ("dock",)},
+    )
+    reach_execute(world, group)
+    assert world.commitments.resource_holds() == {"bridge": group.group_id}
+    world.finish_joint_phase(group.group_id, PHASE_EXECUTE)
+    # Execute finished, handover not started: execute hold already released.
+    assert world.commitments.resource_holds() == {}
+
+    result = world.cancel_joint_phase(group.group_id, PHASE_HANDOVER, by="a2")
+    assert result is group
+    assert group.state == ENDED
+    assert group.end_reason == f"phase_cancelled:{PHASE_HANDOVER}"
+    assert group.phase_state[PHASE_EXECUTE] == COMPLETED
+    assert group.phase_state[PHASE_HANDOVER] == CANCELLED
+    assert world.commitments.resource_holds() == {}
+    world.dispatch_due()
+    assert len([e for e in seen if e.type == "joint_phase_cancelled"]) == 1
+    status = world.joint_status(group.group_id)
+    assert status["held_resources"] == {}
+
+
+def test_cancel_during_execute_keeps_hold_until_safe_end_across_restore():
+    world, runtimes = make_world()
+    seen = track_events(world)
+    group = request_phased(
+        world, "a1", ("a1", "a2"),
+        {PHASE_PREPARE: (), PHASE_EXECUTE: ("bridge",),
+         PHASE_HANDOVER: ("dock",)},
+    )
+    other = request_phased(
+        world, "solo", ("solo",),
+        {PHASE_PREPARE: (), PHASE_EXECUTE: ("bridge",), PHASE_HANDOVER: ()},
+    )
+    reach_execute(world, group)
+
+    # Snapshot before the cancellation, then cancel with execute running.
+    before = WorldArchive.capture(world, runtimes, checkpoint_id="pre-cancel")
+    world.cancel_joint_phase(group.group_id, PHASE_HANDOVER, by="a1",
+                             reason="交接取消")
+    assert group.state == STARTED
+    assert group.ending_reason == f"phase_cancelled:{PHASE_HANDOVER}:交接取消"
+    assert world.commitments.resource_holds() == {"bridge": group.group_id}
+
+    # Snapshot after the cancellation; both branches must agree on the hold.
+    after = WorldArchive.capture(world, runtimes, checkpoint_id="post-cancel")
+    policies = {a: TargetPolicy() for a in ACTORS}
+    types = {a: [MoveToTarget] for a in ACTORS}
+
+    restored, _ = after.restore(policies, action_types=types)
+    r_seen = track_events(restored)
+    r_group = restored.commitments.get_group(group.group_id)
+    assert r_group.state == STARTED
+    assert r_group.ending_reason == group.ending_reason
+    assert restored.commitments.resource_holds() == {"bridge": r_group.group_id}
+    # Re-dispatch on the restored branch only delivers the cancellation
+    # event that was already published before the snapshot; nothing refires.
+    restored.dispatch_due()
+    assert [e.type for e in r_seen] == ["joint_phase_cancelled"]
+    restored.dispatch_due()
+    assert len([e for e in r_seen if e.type == "joint_phase_cancelled"]) == 1
+    assert restored.commitments.resource_holds() == {"bridge": r_group.group_id}
+    # The active phase ends safely exactly once, then the group ends.
+    restored.finish_joint_phase(r_group.group_id, PHASE_EXECUTE)
+    restored.dispatch_due()
+    assert r_group.state == ENDED
+    assert r_group.end_reason == group.ending_reason
+    assert restored.commitments.resource_holds() == {}
+    assert len([e for e in r_seen if e.type == "joint_commitment_ended"]) == 1
+
+    # The pre-cancel branch is unaffected and can still run to completion.
+    pre, _ = before.restore(policies, action_types=types)
+    p_group = pre.commitments.get_group(group.group_id)
+    assert p_group.ending_reason is None
+    assert p_group.phase_state[PHASE_HANDOVER] == WAITING
+    assert pre.commitments.resource_holds() == {"bridge": p_group.group_id}
+
+    # The independent task keeps waiting on the same fact, then proceeds
+    # once the holder's execute phase reaches its safe end.
+    other_status = world.joint_status(other.group_id)
+    blocker = [w for w in other_status["waiting_for"]
+               if w["kind"] == "resource" and w["resource"] == "bridge"]
+    assert blocker and blocker[0]["held_by_group"] == group.group_id
+    assert blocker[0]["held_by_phase"] == PHASE_EXECUTE
+    world.finish_joint_phase(group.group_id, PHASE_EXECUTE)
+    assert group.state == ENDED
+    world.dispatch_due()
+    reach_execute(world, other)
+    assert world.commitments.resource_holds() == {"bridge": other.group_id}
