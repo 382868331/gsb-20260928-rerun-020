@@ -306,6 +306,37 @@ class World:
             publish=self._publish_commitment_event,
         )
 
+    def reschedule_joint_phase(
+        self,
+        group_id: str,
+        phase_id: str,
+        *,
+        by: str | None = None,
+        reason: str | None = None,
+        delay: float = 0.0,
+        valid_for: float | None = None,
+        replacements: dict[str, str] | None = None,
+        resources: tuple[str, ...] | None = None,
+    ) -> JointCommitment | None:
+        """Re-plan a not-yet-started phase with delayed/replaced arrangements.
+
+        Returns the group when an arrangement is adopted, or None when no
+        arrangement is currently adoptable (resources still held, or a
+        replacement member busy); in that case the group keeps waiting.
+        """
+        return self.commitments.reschedule_phase(
+            group_id,
+            phase_id,
+            now=self.clock.now(),
+            by=by,
+            reason=reason,
+            delay=delay,
+            valid_for=valid_for,
+            replacements=replacements,
+            resources=resources,
+            publish=self._publish_commitment_event,
+        )
+
     def diagnose_joint_waits(self) -> dict[str, Any]:
         return self.commitments.diagnose_waits(now=self.clock.now())
 

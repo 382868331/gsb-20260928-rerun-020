@@ -32,6 +32,7 @@
 - `joint_status(group_id)` 的 `waiting_for` 逐项解释当前在等谁（成员角色、最早可用时刻）或等哪个资源（占用方分组与阶段）；`diagnose_joint_waits()` 输出跨分组的 waits-for 图、边与 `cycles`，两个任务互相等待对方下一阶段资源时可直接看到环，而不是静默卡住。
 - `cancel_joint_phase(group_id, phase_id, ...)` 只取消尚未开始的阶段及其后续阶段；已完成或正在执行的阶段、成员说明与事件全部保留。已开始阶段的处理规则固定为“继续到安全结束”：若取消时某阶段正在执行，该阶段继续持有其资源并运行到 `finish_joint_phase(...)`，组合在该阶段安全结束时才以取消原因收尾（发出 `joint_commitment_ended`）；若没有活动阶段，组合立即结束并释放全部占用。两条路径都不会留下无人能够释放的资源：全局资源表、`joint_status` 的 `held_resources` 与其他任务看到的 `waiting_for` 始终是同一事实。重复取消只记录一条 `phase_cancel_rejected`，重复派发不会新增事件或泄漏占用；取消前后的存档各自恢复后，取消与结束事件仍只发生一次。
 - 每个成员每个阶段各有一条就绪承诺（可分别给 `delay`/`valid_for`），阶段开始发出 `joint_phase_started` 并附带成员说明，阶段结束发出 `joint_phase_finished`；阶段状态、资源承诺、成员说明随世界存档保存，重开后已执行事件不会重复触发，恢复出的分支与原世界互不影响。
+- `reschedule_joint_phase(group_id, phase_id, ...)` 提供安全交接重排：正在执行的阶段因后续交接被取消或成员不可用时，可为尚未开始的阶段选择延迟衔接（`delay`/`valid_for`）、替代成员（`replacements`）或替代资源（`resources`）。采用前重新核对真实占用：仍被持有的资源（包括本组活动阶段持有的）不能被候选提前借用，正忙于其他已开始承诺的成员不算可用候选；找不到可行安排时只记录 `joint_phase_reschedule_deferred`，组合保留等待而非虚假结束。重排只撤销该阶段尚未开始的承诺并签发新承诺（`cause["supersedes_commitments"]` 指回原承诺），已完成或正在执行的阶段不会因此再次执行；成员在执行中离开时，分阶段组合的活动阶段同样继续到安全结束（发出 `joint_participant_lost`），只有退出成员尚未开始的承诺被结束，组合可在安全结束前用替代成员重排获救，否则在安全结束后按成员不可用到期收尾。
 
 ## 承诺
 
@@ -130,6 +131,14 @@ status = world.joint_status(group.group_id)
 status["waiting_for"]                  # 解释在等哪些成员或哪个资源（含占用方阶段）
 world.diagnose_joint_waits()           # 跨分组等待图与死锁环 cycles
 world.cancel_joint_phase(group.group_id, "handover", by="bob")  # 已完成阶段不受影响
+
+# 交接被取消或成员不可用时，允许延迟的后续阶段并重新衔接：
+world.reschedule_joint_phase(
+    group.group_id, "handover", by="alice",
+    delay=3,                          # 成员 3 秒后就绪
+    replacements={"gatekeeper": "dave"},  # 替代成员（须不忙于其他已开始承诺）
+    resources=("dock2",),             # 替代资源（仍被占用的候选不会被采用）
+)
 ```
 
 ## 测试

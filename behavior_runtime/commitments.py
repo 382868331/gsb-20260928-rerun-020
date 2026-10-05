@@ -28,6 +28,7 @@ RULE_MEMBER_EXPIRY_ENDS_GROUP = "member-expiry-ends-joint-group"
 RULE_RESOURCE_PRIORITY = "earliest-request-wins-resource"
 RULE_PHASE_SEQUENCE = "phases-start-in-order"
 RULE_FINISHED_WORK_IMMUTABLE = "finished-phases-cannot-be-cancelled"
+RULE_RESCHEDULE_RECHECK = "reschedule-rechecks-occupancy-before-adoption"
 
 # Default phase ordering for a phased joint task.
 PHASE_PREPARE = "prepare"
@@ -630,6 +631,192 @@ class CommitmentLedger:
             self._release_group_holds(group, now)
         return group
 
+    def reschedule_phase(
+        self,
+        group_id: str,
+        phase_id: str,
+        *,
+        now: float,
+        by: str | None = None,
+        reason: str | None = None,
+        delay: float = 0.0,
+        valid_for: float | None = None,
+        replacements: dict[str, str] | None = None,
+        resources: tuple[str, ...] | None = None,
+        publish: PublishFn | None = None,
+    ) -> JointCommitment | None:
+        """Re-plan a not-yet-started phase instead of letting the group end.
+
+        This is the safe-handover reschedule: when a follow-up phase (e.g.
+        handover) was cancelled or a member became unavailable while an
+        earlier phase is still running to its safe finish, the caller may
+        allow a delayed follow-up phase with replacement members and/or
+        alternative resources. Adoption is guarded by the real world facts:
+
+        - Finished or active phases are never re-planned: completed work
+          cannot be re-executed by a reschedule.
+        - Candidate resources still held by anyone (including this group's
+          own active phase) cannot be borrowed early; occupancy is
+          re-checked right before adoption.
+        - A replacement member must not be busy in another started
+          commitment (member capability/availability).
+        - If no arrangement is adoptable, the group keeps waiting exactly
+          as it was; nothing is ended or completed falsely.
+
+        Adopting only revokes the phase's not-yet-started (waiting)
+        commitments and issues fresh ones; cancelled/expired/ended
+        commitments keep their recorded outcome. The phase itself still
+        starts through the normal settlement, which re-verifies member
+        readiness and resource occupancy at that later moment.
+        """
+        group = self.get_group(group_id)
+        if phase_id not in group.phases:
+            raise KeyError(f"unknown phase {phase_id!r} for group {group_id}")
+        if not group.phased:
+            group.record(now, "reschedule_rejected",
+                          detail={"phase_id": phase_id, "by": by,
+                                  "reason": "not a phased group"})
+            return None
+        if group.state not in (WAITING, STARTED):
+            group.record(now, "reschedule_rejected",
+                          detail={"phase_id": phase_id, "by": by,
+                                  "state": group.state})
+            return None
+        phase_state = group.phase_state.get(phase_id, WAITING)
+        if phase_state in (COMPLETED, STARTED):
+            group.record(now, "reschedule_rejected",
+                          rule=RULE_FINISHED_WORK_IMMUTABLE,
+                          detail={"phase_id": phase_id, "by": by,
+                                  "phase_state": phase_state})
+            return None
+        target_index = group.phase_index(phase_id)
+        earlier_open = [
+            earlier_id
+            for earlier_id in group.phases[:target_index]
+            if group.phase_state.get(earlier_id, WAITING) not in (
+                COMPLETED, STARTED,
+            )
+        ]
+        if earlier_open:
+            group.record(now, "reschedule_rejected",
+                          rule=RULE_PHASE_SEQUENCE,
+                          detail={"phase_id": phase_id, "by": by,
+                                  "unfinished_earlier_phases": earlier_open})
+            return None
+
+        replacements = dict(replacements or {})
+        unknown_roles = sorted(
+            set(replacements).difference(m["role"] for m in group.members)
+        )
+        if unknown_roles:
+            raise ValueError(f"replacement for unknown roles: {unknown_roles}")
+        busy_members: dict[str, str] = {}
+        for role, performer_id in sorted(replacements.items()):
+            for commitment in self._commitments.values():
+                if (commitment.performer_id == performer_id
+                        and commitment.state == STARTED):
+                    busy_members[performer_id] = commitment.commitment_id
+                    break
+        candidate_resources = (
+            tuple(resources)
+            if resources is not None
+            else group.phase_resources.get(phase_id, ())
+        )
+        blockers = {
+            resource: {"group_id": holder[0], "phase_id": holder[1]}
+            for resource, holder in self._resource_holds.items()
+            if resource in candidate_resources
+        }
+        if busy_members or blockers:
+            detail = {"phase_id": phase_id, "by": by, "reason": reason,
+                       "blockers": blockers, "busy_members": busy_members,
+                       "candidate_resources": list(candidate_resources)}
+            sequence = self._emit_joint(
+                publish, "joint_phase_reschedule_deferred", group, now,
+                extra=detail,
+            )
+            group.record(now, "reschedule_deferred",
+                          rule=RULE_RESCHEDULE_RECHECK,
+                          detail=detail, event_sequence=sequence)
+            return None
+
+        old_ids = list(group.phase_commitments.get(phase_id, ()))
+        revoked: list[str] = []
+        for commitment_id in old_ids:
+            commitment = self._commitments[commitment_id]
+            if commitment.state == WAITING:
+                commitment.state = CANCELLED
+                commitment.end_reason = (
+                    f"phase_rescheduled:{group_id}:{phase_id}"
+                )
+                commitment.record(now, "cancelled",
+                                   detail={"phase_id": phase_id, "by": by,
+                                           "reason": "rescheduled"})
+                revoked.append(commitment_id)
+
+        cleared_end_reason = None
+        if group.end_reason and (
+            group.end_reason.startswith("phase_cancelled")
+            or group.end_reason.startswith("participant_lost")
+        ):
+            cleared_end_reason = group.end_reason
+            group.end_reason = None
+
+        new_ids: list[str] = []
+        members_detail: list[dict[str, Any]] = []
+        for member in group.members:
+            role = member["role"]
+            performer_id = replacements.get(role, member["participant_id"])
+            commitment = self.request(
+                now=now,
+                requester_id=group.requester_id,
+                performer_id=performer_id,
+                action=group.action,
+                params=deepcopy(group.params),
+                due_at=now + delay,
+                expires_at=None if valid_for is None else now + valid_for,
+                wait_reason=group.wait_reason,
+                cause={
+                    "group_id": group_id,
+                    "phase_id": phase_id,
+                    "phase_index": target_index,
+                    "rescheduled": True,
+                    "supersedes_commitments": old_ids,
+                    "by": by,
+                    "reason": reason,
+                },
+                publish=publish,
+                group_id=group_id,
+                role=role,
+                phase_id=phase_id,
+            )
+            new_ids.append(commitment.commitment_id)
+            replaced = performer_id != member["participant_id"]
+            if replaced:
+                member["participant_id"] = performer_id
+            members_detail.append(
+                {"role": role,
+                  "participant_id": performer_id,
+                  "commitment_id": commitment.commitment_id,
+                  "replaced": replaced,
+                  "note": f"{role} 重新安排进入 {phase_id}"}
+            )
+        group.phase_commitments[phase_id] = new_ids
+        group.phase_resources[phase_id] = candidate_resources
+        group.phase_state[phase_id] = WAITING
+        detail = {"phase_id": phase_id, "by": by, "reason": reason,
+                   "delay": float(delay), "valid_for": valid_for,
+                   "members": members_detail,
+                   "resources": list(candidate_resources),
+                   "revoked_commitments": revoked,
+                   "superseded_commitments": old_ids,
+                   "cleared_end_reason": cleared_end_reason}
+        sequence = self._emit_joint(publish, "joint_phase_rescheduled", group,
+                                    now, extra=detail)
+        group.record(now, "phase_rescheduled", rule=RULE_RESCHEDULE_RECHECK,
+                      detail=detail, event_sequence=sequence)
+        return group
+
     def finish_phase(
         self,
         group_id: str,
@@ -1090,11 +1277,27 @@ class CommitmentLedger:
     ) -> list[Commitment]:
         """End every live commitment that lost a participant."""
         ended: list[Commitment] = []
+        deferred_groups: set[str] = set()
         for group in tuple(self._groups.values()):
             if group.state not in (WAITING, STARTED):
                 continue
             if actor_id not in [m["participant_id"] for m in group.members] and \
                     actor_id != group.requester_id:
+                continue
+            if (
+                group.phased
+                and group.state == STARTED
+                and group.active_phase is not None
+                and actor_id in [m["participant_id"] for m in group.members]
+            ):
+                # A member leaving mid-execution does not kill the running
+                # phase: it continues to its safe finish, the loss is
+                # recorded as the pending end reason, and only the lost
+                # member's not-yet-started promises are ended. The group
+                # can still be rescued by reschedule_phase before the safe
+                # finish lands.
+                deferred_groups.add(group.group_id)
+                self._defer_participant_loss(group, actor_id, now, publish)
                 continue
             group.state = ENDED
             group.end_reason = f"participant_lost:{actor_id}"
@@ -1117,6 +1320,8 @@ class CommitmentLedger:
         for commitment in tuple(self._commitments.values()):
             if commitment.state not in (WAITING, STARTED):
                 continue
+            if commitment.group_id in deferred_groups:
+                continue
             if actor_id not in (commitment.requester_id, commitment.performer_id):
                 continue
             commitment.state = ENDED
@@ -1128,6 +1333,40 @@ class CommitmentLedger:
                                event_sequence=sequence)
             ended.append(commitment)
         return ended
+
+    def _defer_participant_loss(
+        self,
+        group: JointCommitment,
+        actor_id: str,
+        now: float,
+        publish: PublishFn | None,
+    ) -> None:
+        """Record a member loss while the active phase runs to its safe end."""
+        group.end_reason = f"participant_lost:{actor_id}"
+        sequence = self._emit_joint(
+            publish, "joint_participant_lost", group, now,
+            extra={"lost_participant": actor_id,
+                    "active_phase": group.active_phase,
+                    "active_phase_policy": "run-to-safe-finish"},
+        )
+        group.record(now, "participant_lost", rule=RULE_REMOVAL_FIRST,
+                      detail={"lost_participant": actor_id,
+                              "active_phase": group.active_phase,
+                              "active_phase_policy": "run-to-safe-finish"},
+                      event_sequence=sequence)
+        for phase_id in group.phases:
+            if group.phase_state.get(phase_id) != WAITING:
+                continue
+            for commitment_id in group.phase_commitments.get(phase_id, ()):
+                commitment = self._commitments[commitment_id]
+                if (commitment.state == WAITING
+                        and commitment.performer_id == actor_id):
+                    commitment.state = ENDED
+                    commitment.end_reason = f"participant_lost:{actor_id}"
+                    commitment.record(now, "ended", rule=RULE_REMOVAL_FIRST,
+                                       detail={"lost_participant": actor_id,
+                                               "phase_id": phase_id},
+                                       event_sequence=sequence)
 
     def _group_member_commitments(
         self, group: JointCommitment
