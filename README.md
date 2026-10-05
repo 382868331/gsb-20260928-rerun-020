@@ -32,6 +32,9 @@
 - `joint_status(group_id)` 的 `waiting_for` 逐项解释当前在等谁（成员角色、最早可用时刻）或等哪个资源（占用方分组与阶段）；`diagnose_joint_waits()` 输出跨分组的 waits-for 图、边与 `cycles`，两个任务互相等待对方下一阶段资源时可直接看到环，而不是静默卡住。
 - `cancel_joint_phase(group_id, phase_id, ...)` 只取消尚未开始的阶段及其后续阶段；已完成或正在执行的阶段、成员说明与事件全部保留。已开始阶段的处理规则固定为“继续到安全结束”：若取消时某阶段正在执行，该阶段继续持有其资源并运行到 `finish_joint_phase(...)`，组合在该阶段安全结束时才以取消原因收尾（发出 `joint_commitment_ended`）；若没有活动阶段，组合立即结束并释放全部占用。两条路径都不会留下无人能够释放的资源：全局资源表、`joint_status` 的 `held_resources` 与其他任务看到的 `waiting_for` 始终是同一事实。重复取消只记录一条 `phase_cancel_rejected`，重复派发不会新增事件或泄漏占用；取消前后的存档各自恢复后，取消与结束事件仍只发生一次。
 - 每个成员每个阶段各有一条就绪承诺（可分别给 `delay`/`valid_for`），阶段开始发出 `joint_phase_started` 并附带成员说明，阶段结束发出 `joint_phase_finished`；阶段状态、资源承诺、成员说明随世界存档保存，重开后已执行事件不会重复触发，恢复出的分支与原世界互不影响。
+- 活动阶段因后续交接被取消或成员退出时，用户可经 `offer_joint_phase_reschedule(...)` 选择允许延迟的后续阶段：按角色给出具备能力的替代成员（各带 `delay`/`valid_for`）与候选资源束，系统只在阶段真正被采纳时对照实时资源占用表重新核对，尚未释放的资源不会被候选提前借用。
+- 重排不会重做已完成工作：只有尚未开始的阶段承诺被撤销或替换，已完成阶段与其成员名册原样保留；替代成员只在替代阶段的 `joint_phase_started` 中标记 `replacement`。候选资源束在采纳前不产生任何占用，活动阶段继续持有的资源到 `finish_joint_phase(...)` 才释放；找不到可行安排（成员未就绪、能力不足或资源仍被占用）时组合保持等待，状态与 `waiting_for`/`reschedule` 诊断持续反映真实占用，绝不虚假结束；仅当活动阶段安全结束且后续阶段既无就绪成员也无重排提案时，才以 `member_unavailable:<phase>:<roles>` 诚实收尾并发出 `joint_commitment_ended`。
+- 执行中成员退出发出 `joint_member_lost`：活动阶段按“继续到安全结束”保留占用，只撤销未开始阶段中该成员的承诺并登记 `missing_roles`；采用重排时再次核对全部占用，替代成员准备好且资源实际释放后下一阶段才开始，`reschedule_adopted` 记录实际采用的成员与资源束。提案、名册、缺失角色与采用事实随存档保存，分支恢复后阶段只启动一次，最终资源全部释放。
 
 ## 承诺
 
@@ -130,6 +133,19 @@ status = world.joint_status(group.group_id)
 status["waiting_for"]                  # 解释在等哪些成员或哪个资源（含占用方阶段）
 world.diagnose_joint_waits()           # 跨分组等待图与死锁环 cycles
 world.cancel_joint_phase(group.group_id, "handover", by="bob")  # 已完成阶段不受影响
+
+# 活动阶段运行中，交接成员退出：先让活动阶段跑到安全结束，再选择允许延迟的交接
+world.offer_joint_phase_reschedule(
+    group.group_id,
+    "handover",
+    by="alice",
+    member_options=[
+        {"role": "gatekeeper", "performer_id": "dave",
+         "capabilities": ("certified",), "delay": 2, "valid_for": 10},
+    ],
+    resource_options=[{"resources": ("dock",), "delay": 0}],
+    delay=0,
+)  # 采纳前不占用 dock；成员就绪且 dock 真正释放后的 dispatch 才启动交接
 ```
 
 ## 测试

@@ -306,6 +306,38 @@ class World:
             publish=self._publish_commitment_event,
         )
 
+    def offer_joint_phase_reschedule(
+        self,
+        group_id: str,
+        phase_id: str,
+        *,
+        by: str | None = None,
+        reason: str | None = None,
+        member_options: list[dict[str, Any]] | None = None,
+        resource_options: list[Any] | None = None,
+        delay: float = 0.0,
+    ) -> JointCommitment | None:
+        """Opt into a delayed continuation of a not-yet-started phase.
+
+        Candidate members carry their own ``delay``/``valid_for`` and
+        capabilities; candidate resource bundles are only placeholders and
+        are re-checked against real occupation when the phase is adopted.
+        Nothing reserved here is usable before the running phase reaches its
+        safe finish, and if no arrangement can be adopted the group keeps
+        waiting rather than ending.
+        """
+        return self.commitments.offer_phase_reschedule(
+            group_id,
+            phase_id,
+            now=self.clock.now(),
+            by=by,
+            reason=reason,
+            member_options=member_options,
+            resource_options=resource_options,
+            delay=delay,
+            publish=self._publish_commitment_event,
+        )
+
     def diagnose_joint_waits(self) -> dict[str, Any]:
         return self.commitments.diagnose_waits(now=self.clock.now())
 
